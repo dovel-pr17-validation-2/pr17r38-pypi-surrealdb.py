@@ -1,0 +1,376 @@
+name: Build
+
+permissions:
+  contents: read
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: Which packages to build and publish
+        type: choice
+        default: all
+        options:
+          - all
+          - sdk
+          - memory
+
+jobs:
+  # -----------------------------------------------
+  # Which packages does this release ship?
+  #
+  # `surrealdb-memory` is versioned independently of the SDK, so a release of
+  # one must not require a bump of the other. The tag decides:
+  #
+  #   v3.0.1              -> surrealdb + surrealdb-embedded
+  #   memory-v1.0.0-beta.2 -> surrealdb-memory
+  #
+  # Without this every release ran the whole Rust wheel matrix regardless. The
+  # publishes were harmless - `skip-existing: true` turns a re-publish of an
+  # unchanged version into a no-op rather than an error - but nine wheel builds
+  # ran to produce artifacts that were then discarded, and a transient failure
+  # in any of them turned a release that only shipped the memory client red.
+  # -----------------------------------------------
+
+  plan:
+    name: Plan the release
+    runs-on: ubuntu-latest
+    outputs:
+      sdk: ${{ steps.pick.outputs.sdk }}
+      memory: ${{ steps.pick.outputs.memory }}
+    steps:
+      - name: Pick packages
+        id: pick
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          CHOICE: ${{ inputs.packages }}
+        run: |
+          set -euo pipefail
+          case "${CHOICE:-}" in
+            sdk)    sdk=true;  memory=false ;;
+            memory) sdk=false; memory=true  ;;
+            all)    sdk=true;  memory=true  ;;
+            *)
+              # A release event: the tag decides. Anything not prefixed
+              # `memory-` is an SDK release, which keeps every existing tag
+              # behaving exactly as it did.
+              if [ "${TAG#memory-}" != "$TAG" ]; then
+                sdk=false; memory=true
+              else
+                sdk=true;  memory=false
+              fi
+              ;;
+          esac
+          echo "sdk=$sdk" >> "$GITHUB_OUTPUT"
+          echo "memory=$memory" >> "$GITHUB_OUTPUT"
+          echo "tag='${TAG:-}' choice='${CHOICE:-}' -> sdk=$sdk memory=$memory"
+
+  # -----------------------------------------------
+  # Pure Python package (surrealdb)
+  # -----------------------------------------------
+
+  build-python:
+    name: Build pure Python package
+    runs-on: ubuntu-latest
+    needs: [plan]
+    if: needs.plan.outputs.sdk == 'true'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.13"
+
+      - name: Install build tool
+        run: pip install build
+
+      - name: Build package
+        run: python -m build
+
+      - name: Upload package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: python-package
+          path: dist
+
+  # -----------------------------------------------
+  # Agent memory package (surrealdb-memory)
+  # -----------------------------------------------
+
+  build-memory:
+    name: Build agent memory package
+    runs-on: ubuntu-latest
+    needs: [plan]
+    if: needs.plan.outputs.memory == 'true'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.13"
+
+      - name: Install build tool
+        run: pip install build
+
+      - name: Build package
+        run: python -m build
+        working-directory: memory
+
+      - name: Upload package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: memory-package
+          path: memory/dist
+
+  # -----------------------------------------------
+  # Native extension package (surrealdb-embedded)
+  # -----------------------------------------------
+
+  linux:
+    name: Build Linux wheels (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    needs: [plan]
+    if: needs.plan.outputs.sdk == 'true'
+    strategy:
+      matrix:
+        include:
+          - target: x86_64
+            manylinux: auto
+          - target: x86_64-unknown-linux-musl
+            manylinux: musllinux_1_2
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --interpreter 3.10 3.11 3.12 3.13
+          sccache: "true"
+          manylinux: ${{ matrix.manylinux }}
+          working-directory: embedded
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: embedded/dist
+
+  linux-aarch64:
+    name: Build Linux wheels (${{ matrix.target }})
+    runs-on: ubuntu-24.04-arm
+    needs: [plan]
+    if: needs.plan.outputs.sdk == 'true'
+    strategy:
+      matrix:
+        include:
+          - target: aarch64
+            manylinux: auto
+          - target: aarch64-unknown-linux-musl
+            manylinux: musllinux_1_2
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --interpreter 3.10 3.11 3.12 3.13
+          sccache: "true"
+          manylinux: ${{ matrix.manylinux }}
+          working-directory: embedded
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: embedded/dist
+
+  macos:
+    name: Build macOS wheels (${{ matrix.target }})
+    runs-on: macos-latest
+    needs: [plan]
+    if: needs.plan.outputs.sdk == 'true'
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --interpreter 3.10 3.11 3.12 3.13
+          sccache: "true"
+          working-directory: embedded
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: embedded/dist
+
+  windows:
+    name: Build Windows wheels
+    runs-on: windows-latest
+    needs: [plan]
+    if: needs.plan.outputs.sdk == 'true'
+    strategy:
+      matrix:
+        target: [x64]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --interpreter 3.10 3.11 3.12 3.13
+          sccache: "true"
+          working-directory: embedded
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: wheels-windows-${{ matrix.target }}
+          path: embedded/dist
+
+  sdist:
+    name: Build embedded source distribution
+    runs-on: ubuntu-latest
+    needs: [plan]
+    if: needs.plan.outputs.sdk == 'true'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          command: sdist
+          args: --out dist
+          working-directory: embedded
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: sdist
+          path: embedded/dist
+
+  # -----------------------------------------------
+  # Release both packages to PyPI
+  # -----------------------------------------------
+
+  release-python:
+    name: Release surrealdb to PyPI
+    runs-on: ubuntu-latest
+    if: >-
+      needs.plan.outputs.sdk == 'true' &&
+      ((github.event_name == 'release' && github.event.action == 'published') ||
+       github.event_name == 'workflow_dispatch')
+    needs: [plan, build-python]
+    environment:
+      name: pypi
+      url: https://pypi.org/p/surrealdb
+    permissions:
+      id-token: write
+    steps:
+      - name: Download Python package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: python-package
+          path: dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          skip-existing: true
+
+  release-memory:
+    name: Release surrealdb-memory to PyPI
+    runs-on: ubuntu-latest
+    if: >-
+      needs.plan.outputs.memory == 'true' &&
+      ((github.event_name == 'release' && github.event.action == 'published') ||
+       github.event_name == 'workflow_dispatch')
+    needs: [plan, build-memory]
+    environment:
+      name: pypi-memory
+      url: https://pypi.org/p/surrealdb-memory
+    permissions:
+      id-token: write
+    steps:
+      - name: Download memory package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: memory-package
+          path: dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          skip-existing: true
+
+  release-embedded:
+    name: Release surrealdb-embedded to PyPI
+    runs-on: ubuntu-latest
+    if: >-
+      needs.plan.outputs.sdk == 'true' &&
+      ((github.event_name == 'release' && github.event.action == 'published') ||
+       github.event_name == 'workflow_dispatch')
+    needs: [plan, linux, linux-aarch64, macos, windows, sdist]
+    environment:
+      name: pypi-embedded
+      url: https://pypi.org/p/surrealdb-embedded
+    permissions:
+      id-token: write
+    steps:
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: dist
+          merge-multiple: true
+          pattern: wheels-*
+
+      - name: Download sdist
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: sdist
+          path: dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          skip-existing: true

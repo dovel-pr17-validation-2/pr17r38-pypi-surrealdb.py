@@ -1,0 +1,1191 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [3.0.1] - 2026-11-06
+
+### Changed
+
+- Escaped record ids and identifiers use backticks rather than `⟨ ⟩`, matching
+  what SurrealDB displays from 2.6.0 on: `str(RecordID("users", "john-doe"))`
+  is now ``users:`john-doe` ``, and `escape_identifier()` and the query
+  builders' table names and field paths follow suit. Every supported server,
+  2.0.5 included, parses backticks the same way, so the generated queries do
+  not change meaning. Text written with `⟨ ⟩` is still parsed (#427).
+
+## [3.0.0] - 2026-11-04
+
+The first stable release on the 3.0.0 track. Upgrading from `3.0.0-beta.11`:
+a string such as `"person:1"` is now always a table name, so pass a `RecordID`
+or `StringRecordId` to target a record. `file://` and `surrealkv://`
+directories that the 3.x embedded engine wrote must be exported and imported
+again before the 4.0 engine opens them. In-memory and remote connections need
+no other changes.
+
+### Added
+
+- `live()` returns a subscription, as in the JS SDK: an `AsyncLiveSubscription`
+  or `LiveSubscription` that is also the live query's UUID, so passing it to
+  `subscribe_live()` or `kill()` works as before. Iterate it (`async for` on
+  async connections) for notifications; `kill()` it, or use it with
+  `async with`/`with`, to stop the query. Iteration ends cleanly when the
+  query is killed, by this client or another, or the connection closes.
+  `sub.id`, `sub.is_alive` and `sub.managed` describe it.
+
+- `live_of(live_id)` attaches to a live query started some other way, such as
+  a `LIVE SELECT` sent with `query()`. It is not restarted after a reconnect,
+  since the connection does not know its definition.
+
+- `db.batch()` sends several statements as one transaction, in one request:
+  `db.batch().query(sql, vars).query(sql, vars).execute()` returns each
+  statement's result, or raises the statement that failed, with none of them
+  applied. Nothing is held open on the server, so it works on every transport
+  and version, sessions included.
+
+- JS names for transactions and variables: `db.begin_transaction()` begins a
+  transaction on the connection's own session (or on `session_id`), and a
+  transaction works as a context manager, committing when the block finishes
+  and cancelling if it raises. `set(key, value)` is `let` by its JS name, on
+  connections, sessions and transactions.
+
+- `StringRecordId("person:⟨a:b⟩")`, as in the JS SDK: a record id written as
+  SurrealQL, sent for the server to parse. It works wherever a `RecordID`
+  does, including as a query variable, and reaches every id the server can
+  read, including ones `RecordID.parse` refuses. It is also how to pass a record id
+  as text, since a plain string is always a table name.
+
+- Builder modifiers, compiled into the SurrealQL statement:
+  `.where(condition, variables)` on `select`, `update`, `upsert` and
+  `delete`; `.fetch(*paths)`, `.limit(n)`, `.start(n)` and `.version(at)` on
+  `select`; `.output(mode)` (`"none"`, `"null"`, `"diff"`, `"before"`,
+  `"after"` or a list of fields) on writes and inserts; and `.timeout(d)`,
+  SurrealQL's `TIMEOUT`, on all of them. A modifier a statement does not take
+  raises at once.
+
+- `db.relate(from_, edge, to, data=None)` sends `RELATE from_->edge->to`.
+  `edge` is a table or a `RecordID`; either end may be a list of records.
+  With `data`, the edge is created and returned at once (awaited on async
+  connections); without it, a builder taking `.output()`, `.timeout()` and
+  `.content(data)` is returned.
+
+- `db.api(path, method=..., body=..., headers=..., query=...)` calls an
+  endpoint defined with `DEFINE API` and returns an `ApiResponse` (`status`,
+  `body`, `headers`, `ok`). It is sent as `RETURN api::invoke(...)`, so it
+  works in sessions and transactions, and needs SurrealDB 3.0 or later with
+  the `define_api` capability.
+
+- `db.gql(query, vars=None)` runs an ISO GQL query and returns each
+  statement's result. `db.graphql(query, variables=None, operation_name=None)`
+  runs a GraphQL query and returns `{data, errors}`.
+
+- `db.export(options=None)` and `db.import_(data)` on every remote transport,
+  over the server's `/export` and `/import` endpoints with the connection's
+  token, namespace and database. `export()` returns the SurrealQL.
+  `ExportOptions(users=..., accesses=..., params=..., functions=...,
+  analyzers=..., tables=..., versions=..., records=..., sequences=...)`
+  chooses what it includes; `tables` takes `True`/`False`, a list of names or
+  `{"exclude": [...]}`. SurrealDB 2.0 takes no options and says so with
+  `UnsupportedFeatureError`.
+
+  `db.export_to(target, options=None)` writes the export into a file, or a
+  binary file object, as it arrives, so one too large to hold in memory can
+  still be saved. A file is replaced only once the export has arrived in full:
+  one that breaks off leaves an existing file - perhaps the last good backup -
+  as it was.
+
+  `import_()` takes SurrealQL as `str` or `bytes`, or the path of a file as a
+  `pathlib.Path` or other path-like. A `str` is always SurrealQL, so one that
+  names an existing file - `import_("backup.surql")` - is refused with
+  `ValueError` rather than imported as the file's name. A failed statement
+  does not stop the rest, so `import_()` reads the server's answer and raises
+  `ImportFailedError` with every failure in `failures`.
+  SurrealDB 3.1 and later reports only the failures, with their error kinds;
+  older servers report every statement, and the failures are picked out.
+  SurrealDB 3 requires an import to start with `OPTION IMPORT;`, as exports
+  do.
+
+- `auth=` on the connections and on `Surreal`/`AsyncSurreal`, like the JS
+  SDK's `authentication` option, lets a connection sign itself in. It takes
+  signin credentials, an access token, `Tokens`, or a function returning one
+  of those; on `AsyncSurreal` the function may be a coroutine function. A
+  websocket connection applies it when the socket opens. After a reconnect it
+  signs in with the credentials again, or asks the function again, instead of
+  replaying a token that may have expired while the socket was down; a token
+  or `Tokens` given as they are is not applied again, so the tokens a renewal
+  got in their place are the ones replayed. HTTP applies it before its first
+  request. `Tokens` whose access token the server refuses - saved past its
+  expiry, say - are renewed with their refresh token instead.
+
+  With `renew_access=True` (the default), a connection also renews its own
+  access token shortly before it expires: with its refresh token if it holds
+  one and the server supports them, otherwise by applying `auth=` again. The
+  async websocket does this on a timer. The blocking and HTTP connections
+  have no background work, so they renew before the next request that finds
+  the token due. A renewal that fails is reported as an `"error"` event. A
+  refresh token the server refuses is dropped rather than tried again, and
+  the connection signs in with `auth=` instead - or, with no credentials or
+  function to sign in with, carries on with the access token it has.
+
+  Signing the connection's own session in, up or out with `signin()`,
+  `signup()`, `authenticate()`, `invalidate()` or `reset()` takes over from
+  `auth=`, as an explicit sign-in does in the JS SDK: renewing then uses only
+  the refresh token the session holds, and a reconnect replays what the
+  caller chose. `auth=` applies again once the connection starts over:
+  re-pointed with `connect(url)`, or, on a websocket, closed or dropped
+  without a reconnect.
+
+- Token and session management to match the JS SDK:
+  - `db.refresh(tokens=None)` exchanges a refresh token for a new pair over
+    the `refresh` RPC, authenticates with the new access token and returns
+    both. It defaults to the tokens the connection signed in with.
+  - `db.revoke(tokens=None)` revokes a refresh token so it can never be
+    exchanged again.
+  - `db.reset()` returns a session to how it started, with no namespace,
+    database, variables or authentication.
+  - `db.sessions()` lists the ids of the sessions attached on the server.
+  - `db.fork_session()` and `session.fork()` start a new session as a copy of
+    an existing one. `session.id` is the session's id.
+  - `use()` takes either argument alone: `use(database="other")` changes only
+    the database. `None` keeps the current value and `Null` clears it.
+  - `db.health()` asks the server's `/health` endpoint, raising
+    `ConnectionUnavailableError` if the server is unhealthy or unreachable.
+    There is no health RPC, so websocket connections ask over HTTP.
+
+  `refresh`, `revoke`, `reset`, `sessions` and `fork_session` need SurrealDB
+  3.0 and raise `UnavailableFeatureError` on 2.x. Over HTTP, `refresh`,
+  `revoke`, `reset`, `health` and partial `use` work; sessions do not.
+
+- Websocket connections reconnect on their own. When the socket drops, the
+  connection opens a new one, with backoff, and replays what the server forgot
+  with the old one: the namespace and database, the variables from `let`, the
+  authentication, every session from `new_session()`, and every live query.
+  An access token that expired while the socket was down is renewed with the
+  session's refresh token, if it holds one.
+  A live query is started again under a new server-side id, and its
+  notifications keep arriving on the subscription the caller already holds,
+  with the original id. It is started again in the namespace and database it
+  was first started in, even if its session has selected others since; if the
+  session has since signed in as someone else, the subscription ends with
+  `ConnectionUnavailableError` instead. A request in flight when the socket
+  dropped fails with `ConnectionUnavailableError` rather than being sent twice;
+  one made while the async connection is reconnecting waits for the replay. The
+  blocking connection has no background reader, so it reconnects when the next
+  request or live subscription uses the socket. Its first attempt is made at
+  once, and a request waits for the reconnect for at most its own timeout,
+  while the attempts carry on without holding up other threads.
+
+  On by default. `reconnect=False` turns it off, on the connection classes and
+  on `Surreal`/`AsyncSurreal`; `reconnect=ReconnectOptions(attempts=...,
+  retry_delay=..., retry_delay_max=..., retry_delay_multiplier=...,
+  retry_delay_jitter=...)` tunes it, with the JS SDK's defaults. Once the
+  attempts run out the session state is forgotten, live subscriptions end with
+  `ConnectionUnavailableError`, and the next request starts afresh.
+
+- Connection status and events. `db.status` is `"disconnected"`,
+  `"connecting"`, `"reconnecting"` or `"connected"`, and
+  `db.subscribe(event, listener)` calls *listener* on `"connecting"`,
+  `"connected"` (with the server version), `"reconnecting"`, `"disconnected"`,
+  `"error"` (with the exception), `"auth"` (with the new tokens, or `None` once
+  signed out) and `"using"` (with the namespace and database), returning the
+  function that unsubscribes it. `db.namespace` and `db.database` say what is
+  selected.
+
+- A declared server range, checked on connect. Every remote connection now asks
+  the server for its version as the first thing it does - on websocket
+  connections when the socket opens, and over HTTP before the first request -
+  and refuses a server outside `MINIMUM_VERSION` (2.0.0) up to, but not
+  including, `MAXIMUM_VERSION` (5.0.0) with `UnsupportedVersionError`. Pass
+  `version_check=False` to a connection or to `Surreal`/`AsyncSurreal` to
+  connect anyway. 4.x servers are accepted. Pre-release and nightly builds
+  count as the release they lead up to.
+
+  The version is kept on the connection as `db.server_version`, and features
+  that need a newer server are gated on it the way the JS SDK gates them:
+  `Features.SESSIONS`, `API`, `REFRESH_TOKENS` and `TRANSACTIONS` need 3.0,
+  `IMPORT_FAILURE_REPORTING` 3.1 and `QUERY_STREAMING` 3.3.
+  `db.is_feature_supported(Features.SESSIONS)` asks, and using a feature the
+  server lacks raises `UnavailableFeatureError` (a subclass of
+  `UnsupportedFeatureError`) before anything is sent - so `new_session()` and
+  `begin()` on a 2.x server now say what they need instead of passing on the
+  server's "method not found". A server older than 3.3 is no longer sent a
+  `query_stream` request just to learn it does not stream.
+
+- `cbor.2`, the CBOR format SurrealDB 4.0 adds. Over WebSocket the connection
+  offers `cbor.2` then `cbor` and speaks whichever the server picks. Over HTTP
+  it asks for `application/cbor; v=2` and switches once a response comes back
+  in that format. `db.wire_format` says which one is in use. Servers before 4.0
+  keep plain `cbor`, so nothing changes for them.
+
+- Sized numbers: `I8`, `U8`, `I16`, `U16`, `I32`, `U32`, `U64`, `F16` and `F32`,
+  SurrealDB 4.0's fixed-width number kinds, exported from `surrealdb`. Each is
+  an `int` or `float` subclass that refuses a value outside its range; `F16`
+  and `F32` round to their width when made. Over `cbor.2` they are sent with
+  their tags (180 to 188) and read back as these types. Over plain `cbor` they
+  are sent widened, as the server would widen them: an `int`, a `float`, or a
+  `Decimal` for a `U64` past the signed 64-bit range.
+
+- SurrealDB 4.0's other new kinds, as `PlainDate`, `PlainTime`, `Timestamp`,
+  `Interval`, `BigDecimal` and `Regex`, exported from `surrealdb`. Over `cbor.2`
+  they are sent and read back with their tags, 100 and 189 to 193.
+  - A date or timestamp holds any year SurrealDB does, -262143 to 262142, with
+    `infinity` and `-infinity` as `INFINITY` and `NEG_INFINITY`.
+  - A time runs to the nanosecond, up to and including `24:00:00`.
+  - `to_date()`, `to_time()` and `to_datetime()` convert to the standard
+    library types where they can hold the value, and `from_date()`,
+    `from_time()` and `from_datetime()` convert back.
+  - An `Interval` keeps its months, days and microseconds apart, and compares
+    equal to another as the server does, a month as 30 days.
+  - `BigDecimal` is a `Decimal` that keeps its scale as written.
+  - `Regex` holds the text of a pattern in Rust's regex syntax.
+
+  Over plain `cbor` each one is sent as the server widens it: a date as a
+  datetime at midnight UTC, a timestamp as a datetime, a time as a duration,
+  an interval as its ISO 8601 text, and a bigdecimal as a decimal, or as its
+  text if it does not fit one. A `Regex` has no plain `cbor` form and raises
+  `ValueError` there.
+
+- A driver for the surrealdb-protocol v0.15.0 conformance suite
+  (`conformance/`), run in CI against a SurrealDB nightly, and the protocol's
+  CBOR value vectors as unit tests. The vectors are fetched at test time with
+  `scripts/protocol-vectors.sh` rather than committed; without them those tests
+  skip.
+
+### Changed
+
+- Responses are decoded as strictly as a SurrealDB 4.0 server decodes
+  requests. A payload that holds no SurrealDB value raises
+  `UnexpectedResponseError` instead of decoding to something else: an integer
+  outside the signed 64-bit range, a duplicate or non-text object key, a tag
+  SurrealDB does not use (including 0, 9 and 13, the text forms of datetimes,
+  uuids and durations), tag 6 (NONE) over anything but null, a tag of a 4.0
+  kind (100 or 180 to 193) outside `cbor.2`, or a malformed value of any kind.
+  A record id sent as text under tag 8 decodes to a `RecordID`.
+
+- A `datetime.date` is sent as a SurrealDB date, and a naive `datetime.time` as
+  a SurrealDB time. A date used to go out as CBOR tag 1004, which no
+  SurrealDB server reads, and a time raised `TypeError`. A `datetime` is
+  still sent as a datetime.
+
+- A compiled `re.Pattern` raises `TypeError` and points to `Regex`. cbor2 sent
+  it as IANA tag 35, which names another regex syntax, and which SurrealDB
+  refuses.
+
+- **Behaviour change:** a plain string is always a table name. `"person:1"` and
+  `"person:tobie"` used to be parsed by the SDK into a record id (an `int` key
+  when the part after the colon was all ASCII digits, otherwise a string key),
+  so `db.select("person:1")` read one record. It now reads the table that is
+  literally named `person:1`, as the JS, Go, Ruby and Dart SDKs do. Nothing is
+  parsed, coerced, warned about or refused, because a table can legitimately
+  be named `person:tobie`. The same holds for `"user:1..10"`, which is no
+  longer read as a range, and for the ends of `relate()`, which relates
+  records and now raises a `TypeError` for a plain string.
+
+  To target a record, pass `StringRecordId("person:1")` to have the server
+  parse it, or a `RecordID` (`RecordID("person", 1)` or
+  `RecordID.parse("person:1")`). A bare table name such as `"person"` is not
+  affected.
+
+- **Breaking for on-disk embedded databases.** The `surrealdb-embedded`
+  extension now builds against `surrealdb-core` 4.0.0, up from 3.3.5, so
+  `mem://`, `file://` and `surrealkv://` connections run the SurrealDB 4.0
+  engine. SurrealDB 4.0 refuses to open a `file://` or `surrealkv://` directory
+  that a 3.x engine wrote: the connection raises `ConnectionUnavailableError`
+  saying the directory "holds a SurrealKV v0.x database written by SurrealDB
+  3.x", and leaves the files untouched, so the previous `surrealdb-embedded`
+  release still opens them. The message suggests setting
+  `SURREAL_EXPERIMENTAL_UPGRADE_FROM_3X=true`, but the embedded engine does not
+  read `SURREAL_*` environment variables, so that has no effect here. To carry
+  data across, export it with a 3.x `surreal` binary (`surreal export`) and
+  import it into a new 4.0 datastore. In-memory databases are not affected.
+- SurrealDB 4.0 moved most SurrealQL function families behind cargo features.
+  The extension builds the engine without its defaults, to leave out GraphQL
+  and the PostgreSQL and MySQL wire dialects, so it now names each family the
+  3.x engine always had: `crypto::*` digests and password hashing, `geo::*`,
+  `encoding::*`, `parse::url::*`, `string::slug` and `ORDER BY … COLLATE`,
+  `string::html::sanitize`, Unicode regexes, full-text and HNSW indexes with
+  `search::*`, `DEFINE API` with `api::*`, text patches in `RETURN DIFF`, and the
+  background maintenance tasks. Without them those calls failed with "This
+  build was compiled without the `<feature>` feature". File buckets
+  (`DEFINE BUCKET`, `file::*`), experimental in 3.x and unavailable from the
+  embedded engine, now work.
+- Building the extension from source needs Rust 1.95 or later, which a
+  transitive dependency of `surrealdb-core` 4.0 requires.
+- Both `surrealdb` and `surrealdb-embedded` now declare
+  `Development Status :: 5 - Production/Stable` instead of `4 - Beta`.
+  Packaging metadata only; no code changes.
+
+### Fixed
+
+- A `Decimal` is sent in plain notation (`0.0000001`, not `1E-7`), which
+  SurrealDB 4.0 requires, and trailing zeros past SurrealDB's 28-digit scale,
+  such as those `Decimal` arithmetic leaves in `Decimal("0E-30")`, are dropped
+  so the server accepts the number.
+- `select(fields=[...])` delimits every field, so a field named after a
+  keyword is read as the field: `fields=["value"]` used to send
+  `SELECT value FROM ...`, which SurrealQL reads as the keyword.
+- The blocking WebSocket connection no longer emits websockets 17.1's
+  `DeprecationWarning` ("connect() must be used as a context manager") on its
+  first request. It now asks `connect()` for the socket with `legacy=True`
+  where websockets takes it, so it keeps working when `connect()` stops
+  opening the socket itself.
+
+## [3.0.0-beta.11] - 2026-11-03
+
+Upgrading from `3.0.0-beta.10`: nothing to change. Requests still time out
+after 30 seconds unless you set `timeout=`.
+
+### Added
+
+- Request timeouts are configurable. Every request waited at most 30 seconds
+  for its reply, and that was hardcoded in all four remote transports, so a
+  query that legitimately ran longer could not finish. `timeout=` on the
+  connection classes and on `Surreal`/`AsyncSurreal` sets the default, in
+  seconds, and `None` waits indefinitely. `with db.timeout(seconds):` overrides
+  it for the requests made inside the block - on sessions and transactions too
+  - without touching anything else using the connection:
+
+  ```python
+  db = AsyncSurreal("ws://localhost:8000", timeout=10)
+  with db.timeout(300):
+      await db.query("SELECT * FROM big_table")
+  ```
+
+  The override is held in a context variable, so it follows `await` and is
+  inherited by tasks started inside the block, but never leaks into a
+  concurrent task or another thread. The default stays at 30 seconds. The
+  embedded engine accepts `timeout()` and ignores it, since its requests never
+  leave the process (#392).
+
+### Changed
+
+- The embedded extension builds against `surrealdb-core` and `surrealdb-types`
+  3.3.5 (from 3.2.4), so `surrealdb-embedded` now runs the 3.3.5 engine. This
+  affects the `surrealdb-embedded` wheel only (#418, #420).
+- The embedded extension builds against `tokio` 1.54.1 (from 1.53.2) and
+  `uuid` 1.29.0 (from 1.27.0). This affects the `surrealdb-embedded` wheel
+  only (#409).
+- The lockfile moved to `aiohttp` 3.14.5 (#407), `certifi` 2026.10.19 (#414),
+  `pydantic` 2.14.2 (#419) and `pydantic-core` 2.50.2 (#421). The minimums
+  declared in `pyproject.toml` are unchanged, so this changes the versions
+  that CI tests against, not what `pip install surrealdb` resolves.
+- The development tools moved to `maturin` 1.16.0, `mypy` 2.4.1, `pytest`
+  9.2.0, `pytest-asyncio` 1.4.1, `ruff` 0.17.3 and `types-requests`
+  2.33.0.20261030 (#422).
+- The CI and release workflows moved to `actions/setup-python` 7.1.0,
+  `actions/upload-artifact` 7.0.2, `actions/download-artifact` 8.0.2,
+  `astral-sh/setup-uv` 10.3.3 and `pypa/gh-action-pypi-publish` 1.14.3 (#415).
+
+### Fixed
+
+- A `GeometryCollection` that contains a point renders as a valid SurrealQL
+  literal. `str()` wrote each point member as `(longitude, latitude)`, and
+  SurrealDB 3.x reads a collection with such a member as a plain object, not
+  a geometry. Point members now render as GeoJSON objects
+  (`{ type: 'Point', coordinates: [1.0, 2.0] }`). Other members are unchanged
+  (#417).
+- A `PreciseDatetime` keeps its nanoseconds through `copy.copy`,
+  `copy.deepcopy` and `pickle`. All three went through `datetime`'s own
+  reduction, which knows nothing of the extra field, so the copy came back
+  with `nanosecond == 0` and writing it back lost the last three digits of the
+  timestamp (#410).
+
+## [3.0.0-beta.10] - 2026-10-08
+
+Upgrading from `3.0.0-beta.9`: nothing changes at runtime. The one thing to
+know is typing-only - `rows()` now returns `SyncRows[T]` / `AsyncRows[T]`
+instead of `Any`, so code that annotated its result as `AsyncQueryStream` or
+`QueryStream` needs updating. See *Changed* below.
+
+### Changed
+
+- The rows a builder yields are typed. `for row in db.select(...)` and
+  `db.select(...).rows()` returned `Any`, so a typo in `row["nmae"]` went
+  unnoticed by a type checker. A record is now `dict[str, Value]` and
+  `into=Model` gives `Model`, for every target spelling (`Table`, `RecordID`,
+  string) and on `select`, `create`, `update`, `upsert`, `delete` and `insert`,
+  blocking and async. `query(...).rows()` stays `Any` unless `into=` is passed,
+  since a query's rows can be any value.
+
+  `rows()` now returns `SyncRows[T]` / `AsyncRows[T]` (exported, for annotating)
+  instead of `Any`. This is a typing-only change: the object returned is the
+  same one. Code that annotated the result as `AsyncQueryStream` or
+  `QueryStream` will need to use these instead, since `rows(into=Model)` has
+  always returned a mapping wrapper rather than the stream itself.
+
+### Added
+
+- Async builders are iterable. `async for row in db.select(Table("person")):`
+  streams the rows as the server produces them, matching the blocking builders'
+  `for row in ...`: `await builder` gives the whole answer and `async for` gives
+  the rows as they arrive. It is `.rows()` and nothing else, on every async
+  builder (`select()`, `create()`, `update()`, `upsert()`, `delete()`,
+  `insert()` and `query()`), so it streams where the server can and falls back
+  to the buffered rows where it cannot, and stopping early is cleaned up the
+  same way.
+
+## [3.0.0-beta.9] - 2026-10-08
+
+Upgrading from `3.0.0-beta.8`: on the **blocking** client, `select()` and
+`delete()` now return a builder, so `db.select("person")` needs a terminator -
+`.execute()`, or iterate it to stream the rows. A builder you forget to run now
+warns. See *Changed* below.
+
+### Changed
+
+- `escape_identifier` emitted identifiers SurrealDB cannot parse. It wrapped
+  every delimited name in `⟨...⟩` and escaped `⟩` as `\⟩`, on the stated
+  assumption that `⟨...⟩` accepts any string on every supported version. It does
+  not, and the failures were not symmetric — each of these was produced by the
+  old code and refused by a live server:
+
+  | emitted | 2.3.10 | 3.2.3 |
+  | --- | --- | --- |
+  | `⟨with\⟩angle⟩` | accepted | `Invalid escape sequence` |
+  | `⟨back\slash⟩` | internal error | `Invalid escape sequence` |
+  | `⟨trailing\⟩` | internal error | `Unexpected end of file` |
+
+  The last is the worst: a trailing backslash escapes the closing delimiter, so
+  the identifier never terminates and consumes whatever followed it in the
+  statement. A name containing `\` or `⟩` is now delimited with backticks,
+  doubling `\` and escaping `` ` ``, which both versions read identically.
+  Names that already worked keep their exact previous output.
+
+  This reaches `escape_identifier` itself, `RecordID.__str__`, table-name
+  inlining on `INSERT`, and `select(fields=[...])`. Found by reviewing
+  surrealdb.js, which fixed the same defect in its own escaping.
+
+- `QueryError.timeout` returns the `Duration` the statement exceeded instead of
+  always `None`. It was annotated `dict[str, Any] | None` and documented as
+  `{"secs": ..., "nanos": ...}`, and the body only accepted a `dict` — but
+  SurrealDB 3.x sends a `Duration`, so the property reported nothing for every
+  timeout on both websocket and HTTP. `is_timed_out` was always correct, which is
+  part of why it went unnoticed: the branch a caller writes worked and only the
+  detail inside it was empty.
+
+  Still `None` on 2.x, which sends no structured detail for a timeout — that
+  surfaces as an `InternalError` rather than a `QueryError`, so there is nothing
+  to read a duration out of. A `{"secs": ..., "nanos": ...}` mapping is accepted
+  and converted, since no supported version sends one but it is what the old
+  annotation promised. Found by reviewing surrealdb.js, which fixed the same
+  mismatch in its own declaration.
+
+- **Breaking (blocking client only):** `select()` returns a builder, like every
+  other CRUD method, so blocking callers need a terminator:
+
+  ```python
+  records = db.select("person")               # before
+  records = db.select("person").execute()     # after
+  ```
+
+  Async callers are unaffected - builders are awaitable, so `await
+  db.select("person")` is unchanged. `select()` was the only CRUD method that
+  was not a builder, which made it the only one that could not be streamed, and
+  reading a large table is the case streaming is most for.
+
+  `delete()` moved with it, for the same reason and in the same release. The
+  blocking rule is now: a write you give its data (`create`, `update`, `upsert`
+  or `insert` with `data`) runs immediately, and everything else - `select()`,
+  `delete()`, `query()` and the no-data write forms - returns a builder:
+
+  ```python
+  deleted = db.delete(Table("person"))             # before
+  deleted = db.delete(Table("person")).execute()   # after
+  ```
+
+  `DELETE ... RETURN BEFORE` returns rows, so it streams like the rest. The
+  session and transaction forms already *declared* a builder while delegating
+  to an eager connection, so this also makes those signatures true.
+
+### Added
+
+- A builder that is dropped without running now says so. A builder sends
+  nothing until it is terminated, so `db.delete(Table("person"))` with no
+  `.execute()` deleted nothing and raised nothing - the failure mode the
+  blocking `select()`/`delete()` change makes easy to hit, and one the async
+  client always had with a forgotten `await`. Every builder, sync and async,
+  now emits a `RuntimeWarning` when it is garbage-collected unrun, naming the
+  call and the line that made it, the way asyncio does for a coroutine that was
+  never awaited. A builder that ran and failed, or whose constructor raised, is
+  not reported.
+
+  It immediately found a test in this repository that had never run the query
+  it asserted on.
+
+- Blocking builders are iterable. `for row in db.select(Table("person")):`
+  streams the rows as the server produces them (and hands them back one at a
+  time where it cannot stream), and leaving the loop early abandons the
+  server-side query. Iterating is a terminator like `.rows()`, not an implicit
+  `.execute()`: nothing about `bool()`, `==` or indexing runs a builder.
+
+- `len()` and indexing a blocking builder raise a `TypeError` that names
+  `.execute()`, in place of an unrelated failure further down. Type checkers
+  still report both as errors at the call site. `bool(builder)` stays `True`.
+
+- The blocking `insert()` builder has `.rows()`, as the async one already did.
+
+- `ping_interval` and `ping_timeout` on the websocket connections and on the
+  `Surreal`/`AsyncSurreal` factories, in seconds, either accepting `None` to
+  disable that half. They were previously unreachable: the SDK passed nothing to
+  `websockets` and took its defaults, so anyone behind a proxy with a different
+  idle policy had no lever short of reaching into `connection.socket`.
+
+  **The defaults change from the library's 20/20 to 30/10** - a longer gap
+  between pings on an idle socket, and a shorter wait before a silent peer is
+  declared gone. A peer that disappears is still noticed in about the same time,
+  roughly `ping_interval + ping_timeout`. Zero and negative values are refused at
+  the constructor rather than passed on, because `websockets` accepts them and
+  then pings in a tight loop.
+
+  This raises the `websockets` floor from 14.1 to **15.0**, which is the first
+  release whose *sync* client accepts these arguments at all - the async client
+  has had them throughout. Passing them on 14.x raised `TypeError: connect() got
+  an unexpected keyword argument` and took every blocking websocket connection
+  down with it, so there is no version of this that works below 15.0.
+
+- Streaming queries, adopted invisibly. Against SurrealDB **v3.3.0** or later
+  over a websocket, `query()` now asks for its answer as a sequence of frames
+  and rebuilds it as they arrive - and so do `select()`, `create()`, `upsert()`
+  and every builder, because they all reach the wire through the same call. The
+  answer is identical; the server no longer has to finish before any of it
+  reaches the client, and there is no single enormous response to decode. No
+  code changes, and nothing to switch on.
+
+  Every *refusal* is a retry rather than an error - an older server, a denied
+  capability, a connection at its concurrency cap. That is safe because the
+  server frames `begin` before it begins executing, so a refusal with no frame
+  behind it means the query never ran. A socket that dies before the first frame
+  is not a refusal and is not retried: the server may have framed `begin` and
+  begun executing as the connection went, so re-asking could run a write twice.
+  Absent and denied are remembered per connection; the concurrency cap
+  deliberately is not, since remembering a transient refusal would strand the
+  connection on the buffered path. `query()` inside a client transaction is
+  never streamed, because a `commit` arriving mid-stream would commit a prefix
+  of the query. `streaming=False` on a connection or on `Surreal`/`AsyncSurreal`
+  puts `query()` back on the buffered path; an explicit `.rows()` still
+  streams, since asking for a stream outright is taken as meaning it.
+
+- The async client bounds what a slow stream holds. One task drains the socket
+  for every kind of traffic on a connection, so the only backpressure the
+  protocol allows is to stop reading it - which the reader now does once a
+  stream is 32 frames ahead, resuming when its consumer drains to 8. Before,
+  a consumer reading 300 rows of an 8,000-row table held 7,504 of them.
+
+  Pausing is safe only while nothing else needs the reader, so it does not
+  pause while another stream is still waiting, nor while a request or a live
+  subscription is outstanding, and opening any stream resumes it. That matters
+  because every ordinary query is a stream now, so the `query()` a consumer
+  runs from inside its own loop is exactly the case that would otherwise
+  deadlock - measured, before the escape hatch was widened to cover it.
+
+  The blocking client reads on demand and never held anything.
+
+- `stream()` on a query is the low-level view: every value, error and
+  completion as a `ValueFrame`, `ErrorFrame` or `DoneFrame`, each carrying the
+  `index` of its statement. Matching the JavaScript SDK's `stream()`, and for
+  the one thing the other two views cannot show - a statement failing while the
+  statements after it carry on, where `rows()` and `statements()` both stop at
+  the first failure. Discriminated by type rather than by predicate methods,
+  which is how Python tells things apart.
+
+  These are not wire frames: the protocol's own framing stays inside the SDK,
+  so the rules it exists to apply - provisional values, retraction on failure,
+  counting statements by their completions - are still applied here rather than
+  handed to the caller. A query that could not be completed at all still raises.
+
+- `.rows()` on any builder is the visible half: the rows as they arrive,
+  rather than the whole answer at the end. Every builder has two terminators
+  now - `await` (or `.execute()`) for the whole answer, `.rows()` for the rows
+  - so streaming is reached the same way you already build a query. On the async
+  client and the blocking one alike, that is every CRUD method: `query()`,
+  `select()`, `create()`, `update()`, `upsert()`, `delete()` and `insert()`.
+
+  `statements()` on a query is the other view: one `StatementResult` per
+  statement, each once the server says it is complete, so what it yields is
+  never retracted. Only on a query, since one CRUD operation is one statement.
+  Either view is read once. `into=` maps each row onto a model as it arrives,
+  which is the case streaming is actually for.
+
+  The names follow the JavaScript SDK, where `rows()` and `statements()` are
+  the views and `stream()` is a lower-level frame view this SDK does not offer.
+  A statement with a single value, like `RETURN 1 + 2`, is one row; one whose
+  value is NONE, like a `LET` or a `SLEEP`, is no rows.
+
+  ```python
+  async with db.select("person").rows(into=Person) as stream:
+      async for person in stream:
+          if found(person):
+              break            # tells the server to abandon the query
+  ```
+
+  Rows are **provisional** until iteration finishes: a statement that fails
+  after emitting rows raises, and the rows it already yielded are void. That is
+  inherent to streaming rather than a wart - `.statements()` and `query()` are
+  the all-or-nothing views.
+
+  Against a server without the method, one whose capabilities deny it, over
+  HTTP, or on the embedded engine, the query runs the buffered way and its rows
+  are replayed one at a time, so the same code works everywhere; the answer is
+  identical, but rows do not arrive early and the whole result is held.
+  `require_streaming=True` raises `UnsupportedFeatureError` instead when that
+  trade matters, and reports which of those it was - upgrading fixes a server
+  that lacks the method, not one that denies it. Detection is the protocol's
+  own, remembered per connection, so no version string is parsed.
+
+  A statement that fails mid-stream stops the rest of the query, unlike
+  `query()`, which runs the whole query before raising. Use `BEGIN`/`COMMIT`
+  when the statements after a failure must still run - or must all roll back.
+
+  Available on all four connection classes and on sessions and transactions
+  opened from them. Streaming inside a transaction works, but finish the stream
+  before committing: a `commit` that lands mid-stream commits a prefix of the
+  query.
+
+- `File` is a member of the public `Value` union. It was omitted when file
+  support landed, so `db.create(table, {"attachment": File(...)})` - the main
+  reason the type exists - failed a type check on code that worked at runtime,
+  and a returned `File` narrowed to unreachable. The same omission had already
+  shipped once for `set`, so there is now a test asserting the general rule:
+  everything the encoder dispatches on has to be in the union. (`BoundIncluded`
+  and `BoundExcluded` are excluded deliberately - they exist only inside a
+  `Range`, and the server rejects a bare one.)
+
+- File support. SurrealDB stores files in buckets - in memory, on disk, or on
+  object storage such as S3 - and `File` is a reference to one: a bucket plus a
+  key. It carries no bytes and is not a Python file object.
+
+  `db.files` provides typed helpers over the `file::*` functions on the four
+  remote connection classes, and on sessions and transactions opened from them.
+  The embedded classes inherit it, but the embedded engine does not enable the
+  experimental files capability. Note that file writes are **not** transactional:
+  `file::*` writes to the bucket backend rather than the transaction, so a write
+  inside one is visible immediately and survives `cancel()`. That is the server's
+  behaviour, not the SDK's, and there is a test pinning it.
+
+  ```python
+  from surrealdb import File
+
+  avatar = File("images", "/photos/avatar.png")
+  db.files.put(avatar, png_bytes)
+  png_bytes = db.files.get(avatar)          # None if absent
+  meta = db.files.head(avatar)              # FileMetadata | None
+  for entry in db.files.list("images", prefix="/photos", limit=50):
+      print(entry.file.key, entry.size)
+  ```
+
+  `put`, `put_if_not_exists`, `get`, `exists`, `delete`, `head`, `list`, `copy`,
+  `copy_if_not_exists`, `rename` and `rename_if_not_exists`. `get` and `head`
+  return `None` for a file that does not exist rather than raising; `delete` is
+  idempotent; `list` raises when the *bucket* is missing, because an empty bucket
+  and a misspelled one are different mistakes.
+
+  The wire format is CBOR tag 55 carrying `[bucket, key]`, matching the
+  JavaScript SDK's `TAG_FILE_POINTER`. A key is normalised to start with `/`, as
+  it is there, so `File("b", "a.txt")` and `File("b", "/a.txt")` are one file.
+
+  Every helper binds the `File` as a parameter rather than writing it into the
+  query, which is not a style choice: SurrealQL's `f"bucket:/key"` literal
+  accepts only `[A-Za-z0-9_-./]` and has **no escape mechanism**, so a key with a
+  space, an accent or an emoji cannot be expressed as a literal at all. Bound,
+  every key works. `str(File(...))` renders the literal form for logging and is
+  display-only; `File.is_literal_safe()` reports whether a given file could be
+  written into a query.
+
+  `list()` takes `limit`, `prefix` and `start` as keyword arguments rather than
+  an options dict because the server *silently ignores* option keys it does not
+  recognise - a passthrough dict would turn `limti=2` into "every file in the
+  bucket" with nothing to indicate why. `start` is exclusive.
+
+  The reference and the contents are kept as different types: `File` is the
+  bucket-plus-key reference, and contents are plain `bytes` - `put` takes
+  `bytes`, `bytearray` or `memoryview`, and `get` returns `bytes`. A `str` is
+  refused rather than encoded on your behalf, because the server stores bytes and
+  `get` returns them, so accepting one would let `put(f, s)` succeed while
+  `get(f) == s` was False. A file handle is refused too, with a message naming
+  `handle.read()`.
+
+  Buckets are an experimental server feature: the server must be started with
+  `SURREAL_CAPS_ALLOW_EXPERIMENTAL=files`, and the tests detect that capability
+  rather than a version number, since the same build has it or not depending on
+  how it was started. The embedded engine does not enable it, so `db.files` on a
+  `mem://` connection reports the server's own "experimental files feature"
+  error.
+
+
+## [3.0.0-beta.8] - 2026-08-21
+
+The release that makes the memory split usable. `surrealdb-memory 1.0.0-beta.1`
+is already on PyPI, but every install path the docs describe - the `[memory]`
+extra and the `surrealdb.memory` import - lives in this package, so until now
+they pointed at nothing.
+
+### Changed
+
+- **Breaking:** the memory client has moved out of this package. It was
+  `surrealdb.spectron`, bundled into every install; it is now the separate
+  `surrealdb-memory` distribution, installed with `pip install 'surrealdb[memory]'`
+  and imported as `from surrealdb.memory import Memory`.
+
+  The point is release cadence, not size. Bundled, its version *was* the SDK's,
+  so a change to the memory service's API forced a full SDK release - the whole
+  wheel matrix plus the Rust embedded build across six platforms - and every SDK
+  patch republished the memory client unchanged. The `[memory]` extra depends on
+  `>=`, deliberately unlike `[embedded]`'s exact pin, so you can hold `surrealdb`
+  at 3.x and move `surrealdb-memory` across its own majors. (`embedded` pins
+  exactly because that extension is compiled against the SDK and has to match;
+  a client that speaks HTTP to a separate service does not.)
+
+  Product names are gone from the API along with it. `Spectron` and
+  `AsyncSpectron` are now `Memory` and `AsyncMemory`; `SpectronError` and its
+  four subclasses are `MemoryServiceError`, `MemoryAPIError`, `MemoryAuthError`,
+  `MemoryNotFoundError` and `MemoryScopeError`. The base is
+  `MemoryServiceError` rather than `MemoryError` on purpose - `MemoryError` is a
+  Python builtin, and shadowing it means a caller's `except MemoryError:` stops
+  catching an interpreter out-of-memory while a real service failure goes
+  uncaught by code expecting the builtin. The two classes are unrelated, so both
+  directions fail silently.
+
+  `surrealdb.memory` remains the supported import path: it is a small forwarding
+  module in the SDK, so nothing about the short spelling changes. It is a
+  *module* and not a package because two distributions writing into one
+  `surrealdb/memory/` directory installs without complaint and then breaks on
+  uninstall - the survivor imports as an empty namespace package, so
+  `import surrealdb.memory` still succeeds while exporting nothing.
+
+  Migrating is two substitutions:
+
+  ```python
+  # before
+  from surrealdb.spectron import Spectron, AsyncSpectron, SpectronError
+  # after — pip install 'surrealdb[memory]'
+  from surrealdb.memory import Memory, AsyncMemory, MemoryServiceError
+  ```
+
+  Without the extra installed, `surrealdb.memory` still imports and any
+  attribute names what is missing and how to get it, rather than failing with a
+  bare `ModuleNotFoundError`.
+
+  The first release of it is `surrealdb-memory` **1.0.0-beta.1**, and the extra
+  depends on `>=1.0.0b1` rather than `>=1.0`. That is load-bearing: a specifier
+  that does not itself name a pre-release excludes them, so a `>=1.0` floor would
+  leave `surrealdb[memory]` resolving to nothing at all while the client is on
+  its beta line. Two tests read both pyproject files and fail if the floor stops
+  admitting the version the addon declares, or stops being a `>=` floor.
+
+  Releases are now selected by tag, because a memory release must not require an
+  SDK bump. `v<version>` releases `surrealdb` and `surrealdb-embedded`;
+  `memory-v<version>` releases `surrealdb-memory`. Previously every release ran
+  the whole Rust wheel matrix regardless - harmless in that `skip-existing`
+  turns a re-publish of an unchanged version into a no-op, but nine wheel builds
+  ran to produce artifacts that were discarded, and a transient failure in any of
+  them turned a release that only shipped the memory client red.
+
+## [3.0.0-beta.7] - 2026-08-15
+
+The surfaces a new user meets before they call a method: the PyPI page, the
+migration table, the export list, and the examples. A pre-stable audit across
+API parity, packaging, error contracts and documentation found nothing that a
+later release could not fix, so this is the cheap half - the things that are
+simply wrong today.
+
+### Added
+
+- The seven usable geometry classes are now exported from `surrealdb`:
+  `GeometryPoint`, `GeometryLine`, `GeometryPolygon`, `GeometryMultiPoint`,
+  `GeometryMultiLine`, `GeometryMultiPolygon` and `GeometryCollection`. The
+  package used to export exactly one geometry name - `Geometry`, the base class -
+  and that is the single one you cannot send: it constructs, then fails at encode
+  time with `cannot encode Geometry`. `Geometry` is still exported, for
+  `isinstance` checks and annotations.
+- Python 3.14 is supported, tested and declared. The pure-Python package needed
+  no change, and the embedded extension is built `abi3-py39`, so the existing
+  wheel already runs on it. Both are now in the CI matrix rather than only in the
+  classifier list.
+
+### Fixed
+
+- The README's migration table illustrated the `query()` return-shape change
+  with `SELECT 1`, which is a parse error on every SurrealDB version. It is now
+  `RETURN 1`, which runs.
+- Four README links were relative. The README is the PyPI long description, and
+  PyPI renders it with no repository around it, so those four 404'd on the
+  project page.
+- Every example declared `surrealdb>=1.0.7`, which resolves to 2.0.0 and cannot
+  import the 3.x code sitting in the same directory. All 21 declarations across
+  the 12 example projects now ask for `>=3.0.0`.
+- The fastapi example could not be imported by following its own README: it
+  annotates `EmailStr` without depending on `pydantic[email]`.
+- The logfire example crashed twice. `logfire.configure(console=True)` raises
+  `'bool' object has no attribute 'span_style'` before any tracing starts, and
+  the example read `query()` in the 2.x shape - one `TypeError`, and a user count
+  that reported `1` for any query because it measured statements rather than rows.
+- Four `xfail` markers described an SDK that no longer exists. Three were waiting
+  on a `Table` round trip that SurrealDB has since fixed, and one asserted that
+  `live()` over HTTP returns a `UUID` when it has raised `UnsupportedFeatureError`
+  since the transports were made consistent. An `xfail` records only *that*
+  something failed, so the last one would have stayed green if `live()` had begun
+  raising `AttributeError` from a typo.
+
+## [3.0.0-beta.6] - 2026-08-15
+
+One user-visible addition, and a linter that had been switched off without
+anyone noticing.
+
+### Added
+
+- `select(fields=[...])` narrows the projection, so the server sends only the
+  fields asked for rather than the whole record - on all six connection classes.
+  The capability was always reachable through `query("SELECT a, b FROM $r")`;
+  this is the spelling on the method that already binds the resource for you and
+  composes with `into=`. A dot walks into a nested object, and each segment is
+  escaped separately: escaping a whole `"address.city"` would ask for a field of
+  that literal name, which the server answers with a null rather than an error.
+  A field list cannot be parameter-bound - SurrealQL has no `SELECT $f` - so it
+  is the one part that must be inlined, and every name is escaped on the way in.
+  `id` is not included unless you ask for it, exactly as in SurrealQL, so a model
+  passed to `into=` that declares one needs `fields=["id", ...]`. `fields=None`
+  is the default and emits the same statement as before.
+
+### Fixed
+
+- The linter had been checking almost nothing. `select` in the ruff config
+  *replaces* ruff's defaults rather than adding to them, so setting it to
+  `["I", "UP"]` turned pyflakes off across the whole project - nothing had been
+  checking for unused imports, unused variables or undefined names. Turning the
+  defaults back on and adding bugbear, comprehensions, pie, simplify and the
+  ruff-specific rules found 42 unused imports and 12 unused variables. Two other
+  blind spots went with it: `src/surrealdb/__init__.py` was excluded from ruff
+  entirely, and CI pointed it at `./src` alone, so the test suite was linted and
+  formatted by nothing. No behaviour changes, but eight `pytest.raises(Exception)`
+  are now narrowed to what the code actually raises, so they no longer pass on an
+  unrelated `AttributeError`.
+
+
+## [3.0.0-beta.5] - 2026-08-15
+
+The second review pass over the 3.0.0 surface, and the first that verified its
+own fixes: twenty-two defects found by an adversarial review of the shipped
+artifacts, twelve regressions those fixes introduced, and six tests that passed
+against the very code they were written to guard.
+
+### Added
+
+- `Null` and `NullType`. SurrealDB's NULL and NONE are different values, and both used to decode to Python's `None` - which encodes back as NONE, so an ordinary read-modify-write silently *deleted* every NULL field it touched. `None` still means NONE; `surrealdb.Null` is the NULL sentinel. It is falsy, is not equal to `None`, and survives pickling and copying. If you have code comparing a database value with `is None`, check whether the column can be NULL.
+- `SurrealSet`, the type a `set<T>` column now decodes to. A Python `set` cannot hold the members SurrealDB allows - `set<object>` raised `unhashable type: 'dict'` and lost the whole response - and a plain `list` loses the type, so writing a record back either failed on a schemafull field or silently turned it into an array and dropped the deduplication. `SurrealSet` is a `list` subclass that re-encodes under the set tag, so both hold. Writing a plain Python `set` is unchanged.
+- `RecordIdValue`, the union of what SurrealDB accepts as a record id, for annotating or casting against.
+- `Bound`, `BoundIncluded` and `BoundExcluded`. `Range` was exported without them, so the one exported name could not actually be constructed from the public package.
+
+### Changed
+
+- **Breaking.** `RecordID` and `Table` now reject arguments they cannot use. A table name must be a `str`; a record id must be one of `str`, `int`, `uuid.UUID`, `list`, `tuple`, `dict` or `Range`. Both used to accept anything: `Table(None)` was refused by nothing and *succeeded*, writing the row to a table literally named `None` where no query against the intended table would ever find it, on both 2.x and 3.x. `RecordID("t", 1.5)` and friends encoded cleanly and came back as `ValidationError: Parse error`, naming neither the argument nor the mistake. Values decoded from the wire deliberately bypass the check, so a future server's new id type can never make a record unreadable. Also breaking: `RecordID(Table("x"), 1)` worked on 2.0.5 and now raises everywhere (it was already a parse error on 3.x), and a `bytes` record id renders as `t:b'xy'` rather than being decoded - decoding raised `UnicodeDecodeError` on non-UTF-8 and rendered `b"xy"` identically to the *string* id `"xy"`, which is a different record.
+- **Breaking.** The embedded engine now enforces authentication. It was built with authentication disabled, which makes the engine skip every permission check for an anonymous session - and `invalidate()`, whose whole job is to drop the caller's identity, reset the session to exactly that. Invalidating therefore *raised* privilege: a record user who could not read a `PERMISSIONS NONE` table, and could not run `INFO FOR ROOT`, could do both afterwards. The datastore is now built with authentication on and the implicit session seeded as root owner, so opening an embedded database and using it without signing in is unchanged while `invalidate()` leaves the session anonymous and denied, matching websocket and HTTP.
+- A `RecordID` whose id is a `Range` now returns every record in the range. It was classified as a single-record target and unwrapped to the first row, so three records were read, one was returned, and nothing said the other two had been dropped; `delete()` and `update()` reported writing one record while writing all of them. The equivalent `"person:1..=3"` string was always treated as multi-record, so the two spellings of one target disagreed.
+
+### Fixed
+
+- Identifiers SurrealDB will not accept bare are now quoted. The rule was `str.isalnum()`, which Python answers True for a letter or digit of *any* script, so `héllo`, `таблица`, `表格` and the superscript `²` were judged safe and inlined unquoted - and `INSERT` is the one statement whose target the SDK inlines rather than binds, so inserting into a non-ASCII table name failed with `Parse error: Invalid token`. A leading digit (`1tbl`) was passed through for the same reason and refused for a different one. `str(record_id)` also escapes the table half now, not just the id; it rendered as unparseable SurrealQL for exactly those names, from the method the docs point at for composing query text.
+- Three dependency floors that could not work. `websockets>=14.1`, `pydantic-core>=2.10.0` and `aiohttp>=3.14.0` are the versions the SDK actually needs; the declared minimums were lower than the APIs in use, so a resolver honouring old pins produced an install where `import surrealdb` raised. CI now runs the suite against the declared floors so this cannot drift again.
+- A read-modify-write no longer corrupts data in six ways. A nanosecond timestamp lost its last three digits and stored the truncated value back; a naive `PreciseDatetime` was encoded as local time rather than UTC; a `Range` with an unbounded end could never be written back; `Duration.parse` accepted strings the server rejects and turned them into *different* durations rather than errors (`"1.5s"` parsed as the `5s` inside it, `"-1s"` lost its sign); a `set<T>` field lost its type; and a NULL field was deleted. Each is now a round trip that holds.
+- `run()` sees `let()` bindings on HTTP, and `update()` on a record that does not exist answers `None` rather than an empty list. The HTTP transports replay session variables themselves, and were not replaying them into `run()`; `update()` returned `[]` for an absent record, which is neither the `dict` the overloads promise nor the `None` `select()` gives, so `if db.update(rec, data):` was False for a missing record but `db.update(rec, data)["field"]` raised `TypeError`.
+- One malformed request no longer fails its neighbours. A protocol error arrives with no `id`, and the async websocket failed *every* pending future when it saw one - so three unrelated queries on the same connection all came back `Parse error` because a fourth, concurrent one was malformed. The error is now held and delivered to the request it belongs to. A websocket whose reader had stopped is also reopened rather than left permanently wedged.
+- Every live-query notification is delivered, and a killed subscription ends. The blocking transport dropped notifications that arrived between an RPC's send and its reply, and `kill()` left same-connection subscribers waiting forever on 2.x, which sends no `KILLED` frame. Async subscribers are now woken when the connection dies instead of waiting on a queue nothing will ever fill.
+- The connection-type aliases resolve at runtime. `BlockingSurrealConnection` and `AsyncSurrealConnection` are exported for annotating a connection, and were built from forward-reference *strings* - so `typing.get_type_hints`, `inspect.signature(eval_str=True)`, pydantic and FastAPI all raised `NameError` naming a class the user had never imported. They are built from the real classes now, and a sweep guards every public alias against the same defect.
+- `with db:` on a connection that is already open keeps it. Entering assigned a fresh socket unconditionally, and a websocket *is* the server-side session, so the sign-in went with it and the first statement inside the block came back `NotAllowedError`. Both HTTP transports leaked a connection pool per re-entry the same way.
+- `connect()` after `close()` reopens the embedded engine. `close()` shuts the datastore down for good while the native `connect()` was a no-op returning success, so reconnecting reported a working connection and then refused every request. A reopened `memory://` database starts empty; a file-backed one keeps its data.
+- An async websocket used from a second event loop says so. It failed with a bare `ValueError` from inside asyncio and then stayed wedged; it now raises `ConnectionUnavailableError` naming the cause and the fix, and `close()` works across loops so the advice is actionable.
+- An async websocket dropped without `close()` releases its socket. The reader task held a strong reference to the connection, so it was never collected and no finaliser could run - forty dropped connections held forty file descriptors, and `asyncio.run` closing its loop printed `Task was destroyed but it is pending!` on the way out. It now holds a weak reference and releases the socket on collection, with a `ResourceWarning` like an unclosed file.
+- A record that does not match an `into=` model says which model and which fields, inside the `SurrealError` tree, instead of a bare `TypeError` raised from inside the model.
+- A bare `Range` as a resource target is refused with an explanation instead of `TypeError: argument of type 'Range' is not iterable` - and the error next to it no longer recommends passing one.
+- Six README examples that did not work: the `into=` block wrote a field its own model did not declare, the sync block deleted a table nothing had created, and six live-query examples iterated `subscribe_live` without awaiting it. The runnable blocks are now executed by the test suite rather than only read.
+
+- Sending a Python `set` to a SurrealDB 2.x server now says what went wrong. Sets are encoded with SurrealDB 3.x's CBOR set tag; 2.x has no set representation at all - it returns SurrealQL sets as plain arrays - so it answered with a bare `Encountered an unknown CBOR tag`, which named neither the cause nor the remedy. That message now carries both. The hint is attached from the server's own wording, so nothing else is affected and no version probe is added; the trade-off is that SurrealDB 2.0.x reports the same rejection as `Invalid Request`, which is too generic to attach anything to safely. The README's new *Talking to a SurrealDB 2.x server* section covers the limitation for both.
+- The README now documents that error *kinds* need SurrealDB 3.x. The subclasses below `ServerError` come from the `kind` the server reports, and 2.x does not send one - its error payload carries only a generic `-32000` code and a message - so every server-side failure arrives as `InternalError` there. `except SurrealError` and `except ServerError` work everywhere, but a narrower `except ThrownError` silently never matches on 2.x. The SDK cannot recover the classification, because it is not on the wire; saying so is the only honest fix.
+
+- A rejected `authenticate()` no longer destroys the connection. Both HTTP transports assigned the token to the connection *before* sending it, so a token the server refused stayed attached to every later request - including the `signin()` that would have recovered the connection, which the server then answered with `401`. One failed `authenticate()` left the connection permanently unusable, with no way back short of building a new one and nothing anywhere saying so. The token now authorises the `authenticate` request alone, and is adopted as the connection's identity only once the server accepts it. A token the SDK's own request schema rejects - one that is not JWT-shaped, and so never leaves the process - did exactly the same damage, and is covered too. The websocket transports already assigned after the reply arrived; they gained tests so all four stay in step.
+
+- A closed blocking websocket connection can be opened again. `close()` closed the socket but kept the reference to it, so `connect()` saw a connection and returned without doing anything, and every call after it failed against the dead socket - `connect()` after `close()` was a silent no-op, on the one transport whose async twin had always cleared it. `close()` now drops the reference, `__exit__` goes through it, and both `connect()` and the lazy reconnect inside `_send` open a fresh socket. That socket is a new server-side session, so it starts unauthenticated and with no namespace or database selected; sign in and `use()` again after reconnecting, as `close()` now documents.
+- `connect(url)` re-points a connection that is already open. Both websocket transports returned early whenever a socket existed, so the new URL was silently discarded and the connection carried on talking to the old endpoint while reporting the new one - the docstring described a re-point that never happened. Passing the url the connection is already using is still a no-op: reconnecting costs the server-side session, so a defensive `connect(url)` must not quietly undo a completed `signin()`.
+- A blocking websocket connection dropped without `close()` no longer leaks its socket and threads. Every open websocket holds a TCP socket and two `websockets` worker threads (`recv_events` and `keepalive`), and nothing released them, so a program that built connections in a loop and let them fall out of scope accumulated all three per connection until the process exited - five discarded connections left ten threads running. The socket is now released when the connection is collected. That is deliberately not the closing handshake `close()` performs: the graceful path joins the reader thread, which never returns at interpreter shutdown - by then the reader has been stopped without releasing its lock - and which stalls whoever dropped the last reference for the full close timeout whenever the peer has gone quiet.
+
+- Live queries are refused with a `SurrealError` on the transports that cannot serve them. The README documents them as WebSocket-only, but the four non-websocket connection classes disagreed with it and with each other. Embedded `subscribe_live()` raised a bare `AttributeError` naming an internal attribute, because both embedded constructors hand-copied a subset of the attributes their parents set and that one was not in it; embedded `live()` and `kill()` reached the engine and came back as `Unable to perform the realtime query`, which does not say why; and on HTTP all three raised `NotImplementedError`, which is not a `SurrealError`, so the single `except SurrealError` the README promises covers every failure missed them - while `attach()` on the very same object was covered. All three now raise `UnsupportedFeatureError` giving the reason, on both HTTP and both embedded connections, and `subscribe_live()` raises on the call rather than on the first `next()`, so the error points at the line that made the mistake. The embedded constructors now run their parent's - it opens nothing, it only sets attributes - so a future divergence cannot strand an inherited method again.
+
+- Nanosecond precision survives a round trip. `datetime` resolves to microseconds, so decoding a SurrealDB timestamp dropped its last three digits - and writing that value back stored the truncated form, so an ordinary read-modify-write destroyed precision *in the database*, silently and with no error. Timestamps now decode to `PreciseDatetime`, a `datetime` subclass that keeps the remainder in `.nanosecond` and re-encodes it in full. It is a `datetime` in every other respect: `isinstance` holds, it compares and sorts against plain `datetime` values, and pickle and copy round-trip, so existing code is unaffected. Encoding a plain `datetime` is untouched - the hook is registered for the subclass alone. One limit is inherent: `datetime` arithmetic builds results through constructors that know nothing of the extra field, so a computed value carries `nanosecond == 0`. Precision survives storage and retrieval, but not computation.
+
+- A zero-valued `Duration` no longer destroys the response it appears in. The server omits trailing zero components, so a zero duration arrives as an *empty* CBOR array; the decoder handled one and two elements and indexed `[0]` otherwise, raising `IndexError` and losing the entire result rather than one field. A `Duration(0)` written by the SDK itself could never be read back.
+- An integer SurrealDB cannot represent is now refused instead of being silently corrupted. SurrealDB stores integers as signed 64-bit, but a Python int above the signed maximum still fits CBOR's unsigned range, so it encoded cleanly and the server reinterpreted the bits: `2**63` came back as `-9223372036854775808` and `2**64 - 1` as `-1`, with no error raised anywhere. Values outside the signed 64-bit range now raise `ValueError` at encode time, naming the range and suggesting a string or `Decimal`. This is deliberately a builtin rather than a `SurrealError`, like the encoder's other caller-mistake case.
+
+- A timed-out websocket RPC no longer desynchronises the connection. The deadline added to stop protocol errors hanging forever introduced its own failure: the request had already been sent, so the server's late reply stayed in the socket and the next call read *that* instead of its own, mismatching ids from then on and never recovering. Abandoned request ids are now remembered and their late replies dropped, so a timeout costs one call rather than the connection. This was never released - it existed only on `main`.
+- An async websocket connection is no longer bricked by a single bad frame. `_recv_task` ended on the first frame it could not handle - a protocol-level error carrying no `id`, or anything that failed to decode - and because the socket stayed open, `connect()` saw a live socket and did nothing while every later request waited on a future nothing would ever resolve. With no timeout on that path the caller hung indefinitely, and the reported error claimed the connection had closed when it had not. The receive loop now survives a bad frame and hands the failure to the callers waiting on it, every RPC wait is bounded by the same 30 second deadline the blocking transport uses, and `connect()` re-establishes a connection whose reader has stopped. The blocking transport was given this treatment when the same defect was found there; the async twin was missed.
+
+- `create`, `update`, `upsert` and `insert` treat an explicit `data=None` the same way on every transport. The async connections used `None` as the default for `data`, so an explicit `None` was indistinguishable from omitting the argument: they returned an unconfigured builder and silently ignored it, while the blocking connections ran `CONTENT NULL` and raised. The same call therefore did nothing on async and failed on blocking. The async side now uses the same sentinel the blocking side already did, so both raise. `None` remains a legal *value* meaning `CONTENT NULL`; it is only disqualified as the marker for "not supplied".
+- `AsyncSurrealSession` and `BlockingSurrealSession` expose `subscribe_live()`. Both already had `live()` and `kill()`, so a session could start a live query it had no way to consume - callers had to reach past the wrapper to the underlying connection.
+
+### Removed
+- `set_token()` on the HTTP connections. It existed on those two classes only, was undocumented and unreferenced, and assigned the token without the `AUTHENTICATE` call that validates it - so a caller could believe they were authenticated while the server had never seen the token, with the failure surfacing later on an unrelated call. `token` is a public attribute, so `db.token = ...` does everything the method did; `authenticate()` remains the way to authenticate for real.
+
+- `surrealkv+versioned://` works. The scheme is documented in the README, advertised in the 3.0.0-alpha changelog as a feature, and named in `UnsupportedEngineError`'s own message as a valid embedded form - but every path failed with `Unable to load the specified datastore`, because the engine matches storage flavours exactly and takes MVCC versioning as a *query parameter* rather than as part of the scheme. The extension now translates `surrealkv+versioned://<path>` into the form the engine parses, appending to any query string the caller supplied rather than replacing it. Time-travel queries (`SELECT ... VERSION d"..."`) return the value as of that moment, and are still correctly rejected on a plain `surrealkv://` store.
+- Operational failures that used to escape the `SurrealError` hierarchy now stay inside it, so `except SurrealError` covers them. A malformed URL raised a bare `ValueError` from `urlparse` or from `.port` - an out-of-range port, a non-numeric port, an unterminated IPv6 literal - even though an unrecognised *scheme* was already mapped, so the same call landed inside or outside the hierarchy depending on which part of the URL was wrong. These now raise the new `InvalidUrlError`. An embedded connection used after `close()` raised a bare `RuntimeError` from the native extension where the websocket and HTTP transports raise `ConnectionUnavailableError` for the same mistake; every failure from the engine is now mapped, with the extension's own message kept as `__cause__`. A CBOR tag the SDK cannot decode - a value from a newer server - now raises `UnexpectedResponseError` instead of `BufferError`.
+- A value the SDK cannot encode now raises `TypeError` rather than `BufferError`, and names the offending type and the supported ones. This is deliberately *not* a `SurrealError`: passing an unserialisable object is a caller mistake, and Python's answer to that is `TypeError`. Wrapping it would hide programming errors inside the `except SurrealError` that exists for operational failures - the same reason the SDK's argument validation keeps raising `ValueError`.
+
+- A `Duration` can be sent to the database again. The CBOR encoder tagged it 13 - the *string* form - while carrying the `[seconds, nanoseconds]` array payload that belongs under tag 14, so every write containing a `Duration` was rejected by the server with HTTP 400, on every transport and against the embedded engine. Reading a `Duration` always worked, and the SDK's own decoder accepts either shape, so an encode/decode round trip passed and hid the defect. The regression test asserts the emitted wire tag rather than the round trip.
+- The blocking websocket connection no longer hangs forever on a protocol-level error. SurrealDB answers a request it cannot parse with an error frame carrying no top-level `id`, and `_send` classified any id-less frame as a live-query notification - so the only reply the call would ever get was discarded and the receive loop blocked on `recv()` indefinitely. Ordinary calls triggered it, such as passing an integer too large to encode. Id-less frames carrying an error are now raised, and every RPC read is bounded by a 30 second deadline matching the HTTP transports, so no reply can block a caller forever.
+- The embedded examples in the README no longer call `signin()`. Embedded connections have no server and no root user, so every one of the three quick-start examples in that section failed with `NotAllowedError` when run as written - and that section renders on the PyPI project page. `examples/embedded/README.md` also still told readers the engine ships with `pip install surrealdb`; it now shows the `embedded` extra, like the main README.
+- `connect()` now exists on `BlockingWsSurrealConnection`. It was the only connection class without it, so calling `connect()` raised `AttributeError` there while the other five transports connected - the same transport-agnostic breakage that adding `connect()` to the HTTP connections in 3.0.0-beta.4 was meant to remove. It opens the socket eagerly (the connection otherwise connects lazily on first use), is a no-op when already connected, and re-points the connection when passed a url, matching the other transports. Both connection templates now declare `connect()` as well, so a transport that omits it fails with a diagnosable `NotImplementedError` rather than `AttributeError`.
+- The README no longer states that the embedded database is included in the default install. It is an optional native extension behind the `embedded` extra, so the documented `pip install surrealdb` left readers without the engine they had just been told they had. The section now shows `pip install 'surrealdb[embedded]'`, and its source-build command gained the `--manifest-path embedded/Cargo.toml` it needs to build the Rust crate rather than the root project.
+
+## [3.0.0-beta.4] - 2026-08-10
+
+Seven defects found by verifying the 3.0.0-beta.3 artifacts as a user installs them, rather than from the working tree. Most sit on the default `pip install surrealdb` path, which the test suite never exercised because it always has the optional engine present.
+
+### Fixed
+- `from surrealdb import *` no longer raises `AttributeError` on a plain `pip install surrealdb`. `__all__` advertised `AsyncEmbeddedSurrealConnection` and `BlockingEmbeddedSurrealConnection` unconditionally, but both are imported under a `try`/`except ImportError` and are absent without the optional `surrealdb[embedded]` engine - so the default install exported two names that did not exist, breaking star imports and anything that walks `__all__`. They now join `__all__` only when the engine is present, and accessing either without it raises an `AttributeError` naming the extra to install.
+- An unsupported URL scheme now raises `UnsupportedEngineError` rather than a bare `ValueError` escaping from enum construction. `Surreal("ftp://...")`, `Surreal("rocksdb://...")` and `Surreal("localhost:8000")` all previously raised `ValueError: '...' is not a valid UrlScheme`, which `except SurrealError` did not catch - contradicting the guarantee that every failure the SDK raises is a `SurrealError`. The original `ValueError` is preserved as `__cause__`. **This changes the exception type**: code catching `ValueError` from connection construction should catch `SurrealError` (or `UnsupportedEngineError`) instead.
+- `Surreal("memory")` works. The bare form is documented in the README as equivalent to `mem://` and is named as valid in `UnsupportedEngineError`'s own message, but `urlparse` reports an empty scheme without a `://` separator, so it raised `ValueError: '' is not a valid UrlScheme`. Only the documented bare spellings are matched, so scheme-less nonsense such as `Surreal("http")` is still rejected.
+- The `surrealdb-embedded` wheel now ships a `py.typed` marker. It already included hand-written stubs for the native module (`_ext.pyi`), but PEP 561 requires type checkers to ignore stubs in a package that is not marked, so the stubs had no effect.
+- `connect()` works on the HTTP connections. Both inherited the template default, which raised `NotImplementedError`, while the websocket transports connected - so transport-agnostic code calling `connect()` broke on HTTP alone. HTTP opens no persistent connection, so it is accepted as a no-op, and passing a url re-points the connection exactly as the websocket transports do.
+- A trailing slash on the endpoint no longer doubles up in the `/rpc` URL. Every remote transport builds its endpoint as `f"{raw_url}/rpc"`, so `Surreal("http://host/")` produced `http://host//rpc` - visible to users in connection error messages. `Url.raw_url` now drops a trailing slash when there is a host to drop it from, leaving embedded forms such as `mem://` untouched.
+
+### Changed
+- The source distribution now contains only what is needed to build the package and run its tests against the source: `src`, `tests`, `README.md`, `LICENSE`, `CHANGELOG.md` and `pyproject.toml`. It previously shipped the entire working tree - CI workflows, editor config, Docker files, and the Rust crate belonging to the separate `surrealdb-embedded` package - which made it 480 KB against a 142 KB wheel. The wheel is unchanged.
+
+## [3.0.0-beta.3] - 2026-08-10
+
+A small correctness and dependency release. Embedded connections now report the engine version they actually run, and the `aiohttp` floor moves onto the release carrying CVE-2026-34993's fix.
+
+### Fixed
+- `version()` on an embedded connection now reports the SurrealDB engine version rather than the version of the `surrealdb-embedded` extension. The RPC handler formatted the extension crate's own `CARGO_PKG_VERSION`, so `mem://`, `file://` and `surrealkv://` connections answered `surrealdb-3.0.0-beta.2` while the engine they actually run is `surrealdb-core` 3.2.4 - the opposite of what the same call returns over HTTP or WebSocket, and misleading in the very release that moved the embedded engine to 3.2. Both the async and blocking implementations now read `surrealdb_core::env::VERSION`, which is compiled into the engine and so cannot disagree with what the wheel links. The extension's own version remains available as `importlib.metadata.version("surrealdb-embedded")`. Embedded version strings carry no `+<date>.<sha>` build metadata, because that suffix is derived from a git checkout of the SurrealDB monorepo and does not exist for an engine built from a published crate.
+
+### Changed
+- The minimum `aiohttp` is now 3.14.0, up from 3.13.4. 3.14.0 is the first release carrying the fix for CVE-2026-34993 (GHSA-jg22-mg44-37j8) in `CookieJar.load()`; the SDK never touches `CookieJar`, so the path was not reachable through it, but the floor now keeps users off the affected range. aiohttp 3.14 still supports Python 3.10, so this costs no platform coverage.
+- The async HTTP tests no longer mock `aiohttp` with `aioresponses`; they run against a throwaway local `aiohttp` server instead. This removes the `aiohttp<3.14` resolution cap and the `aioresponses` test dependency entirely, so the suite now runs on the `aiohttp` users actually install rather than on a version pinned below it. The cap existed because `aioresponses` cannot construct aiohttp 3.14's `ClientResponse`, and upstream is not moving: its default branch has been unchanged since April 2026, four aiohttp-3.14 pull requests are open and unmerged, and aiohttp's own maintainers have declined to accommodate it. Because the cap was resolution-only, every user on every supported Python already received 3.14.x - a combination CI had never exercised. Test counts are unchanged, and the replacement asserts strictly more in places: real connection refusals and real timeouts now replace injected exceptions, and several cases gained `__cause__`, `.url` and `.kind` assertions that the mock could not express.
+
+## [3.0.0-beta.2] - 2026-08-10
+
+A maintenance beta. No API changes: the notable part is that the embedded engine moves from SurrealDB 3.0 to 3.2, and that the dependency surface is now watched rather than hand-bumped.
+
+### Changed
+- The `surrealdb-embedded` extension now builds against `surrealdb-core` 3.2.4, up from 3.0.5, so `mem://`, `file://` and `surrealkv://` connections run the 3.2 engine and pick up everything that landed in 3.1 and 3.2. The native glue moved with the `RpcProtocol` trait: its session map is now keyed by a concrete `Uuid` rather than `Option<Uuid>`, so the embedded connection's single implicit session is registered under a generated id and every request without a session id routes to it. Behaviour is unchanged - the embedded connection has never supported `attach`/`detach` or client-side transactions, and `use`/`signin` state still persists across calls on a connection. CBOR request decoding now bounds nesting with the datastore's `max_object_parsing_depth` (default 100), matching what the server applies to its own parsers.
+- Refreshed the rest of the dependency surface: every pinned GitHub Actions workflow dependency moved to its current release, the Python lockfile moved to current (notably `mypy` 2.3.0 and `ruff` 0.16.2), and the CI/docker-compose SurrealDB server versions moved to the latest patch of each series already covered (`v2.1.9`, `v3.0.5`). `aiohttp` stays capped below 3.14 for resolution only - `aioresponses` 0.7.9 still cannot construct 3.14's `ClientResponse` - and the cap remains absent from published wheel metadata.
+
+### Added
+- A Dependabot configuration covering GitHub Actions, the `uv` Python lockfile, and the embedded extension's Cargo manifest, so these no longer drift silently between releases. `surrealdb-core` and `surrealdb-types` are excluded from the grouped Rust updates: a bump there decides which SurrealDB engine the embedded wheel ships and has changed the `RpcProtocol` trait within a minor release, so each gets its own reviewable pull request.
+
+## [3.0.0-beta.1] - 2026-08-09
+
+First beta on the 3.0.0 track. The v3 API surface settled over the alpha series is now considered feature-complete, and this release closes the last two gaps in it: every failure the SDK raises is a `SurrealError`, and the session/transaction wrappers expose the full connection RPC set. Both packages move to the `Development Status :: 4 - Beta` classifier.
+
+### Added
+- `TransportError`, a new branch of the error hierarchy for failures that produced no structured server response, alongside the existing `ServerError` branch. `ConnectionUnavailableError` now derives from it, joined by `TransportTimeoutError` (the request timed out) and `HttpStatusError` (a non-2xx HTTP response, carrying `.status`, `.body`, and `.url`). The split is what retry logic keys on: a `TransportError` may succeed if retried, a `ServerError` describes a decision the server already made.
+- `query_raw()`, `info()`, and `version()` on the session and transaction wrapper classes (`AsyncSurrealSession` / `BlockingSurrealSession`, `AsyncSurrealTransaction` / `BlockingSurrealTransaction`). These were the only connection RPCs missing from the wrappers, so calling `session.query_raw(...)` raised `AttributeError` even though the underlying connection method already accepted `session_id` / `txn_id`. Each forwards the session (and, on a transaction, the txn) like every other wrapper method.
+
+### Fixed
+- Transport failures no longer escape as third-party exceptions, so `except SurrealError` now reliably covers every failure the SDK raises. Previously the exception type depended on how a failure was represented: an RPC error in a 2xx body became a `ServerError`, but a non-2xx `/rpc` response leaked `requests.exceptions.HTTPError` or `aiohttp.ClientResponseError`, an unreachable host leaked `requests.exceptions.ConnectionError` / `aiohttp.ClientConnectorError` / `ConnectionRefusedError`, and an undecodable body leaked a CBOR decode error. All four transports (blocking/async, HTTP/WebSocket) now map these to `HttpStatusError`, `ConnectionUnavailableError`, `TransportTimeoutError`, or `UnexpectedResponseError`, each preserving the original exception as `__cause__`. A non-2xx response whose body *does* contain a structured RPC error still maps to its `ServerError` subclass.
+
+### Changed
+- Both `surrealdb` and `surrealdb-embedded` now declare `Development Status :: 4 - Beta` instead of `3 - Alpha`. Packaging metadata only; no code changes.
+
+## [3.0.0-alpha.4] - 2026-07-16
+
+### Security
+- Bump the embedded extension's `pyo3` to 0.29.0 (and `pyo3-async-runtimes` to 0.29), fixing a high-severity out-of-bounds read in `PyList` / `PyTuple` iterators and a missing `Sync` bound on `PyCFunction::new_closure`. Affects the native `surrealdb-embedded` package only; no API changes.
+
+## [3.0.0-alpha.3] - 2026-07-16
+
+Follow-up to `3.0.0-alpha.2`: adds the `into=` row-model API, fixes session authentication propagation, aligns `delete` with `select`, and re-enables mypy type-checking on the test suite.
+
+### Added
+- Keyword-only `into=` argument on `select`, `create`, `update`, `upsert`, `delete`, and `insert` (async and sync, including the session/transaction wrappers) mapping each returned record onto a model class — a dataclass, a pydantic `BaseModel`, or any class accepting the record's fields as keyword arguments. Return types are narrowed precisely per `@overload`: a single-record target resolves to `Model` (or `Model | None`), a `Table` target to `list[Model]`. The no-data builder forms (`create(record, into=Model)`, `update(record, into=Model)`, `insert(table, into=Model)`) carry the model through their clause methods (`.content` / `.merge` / … / `.execute`). Mapping reuses the existing `_map_to_class` helper.
+- `query(sql).into(Model, rows=True)` maps each **row** of a single statement's result onto `Model`, returning `list[Model]`. The default `.into(cls)` (statements-to-fields) behaviour is unchanged when `rows` is not set.
+
+### Changed
+- `delete(RecordID)` now returns `dict | None` (the deleted record, or `None` when absent), matching `select`; `delete(Table)` still returns a list.
+- Internal: the test suite is now type-checked by CI (`mypy tests/`) with the full set of error codes enabled, so it guards against public-API type regressions. Only `index`, `union-attr`, and `call-overload` remain suppressed for tests, because the public `Value` union is indexed into pervasively across the suite with no bug-catching value.
+
+### Fixed
+- `new_session()` now propagates the connection's authentication to the new session, so session-scoped operations run with the connection's identity. Previously a freshly attached session was unauthenticated and its writes silently no-opped (the server returned an empty result with no error). `authenticate()` also records the connection's token so it can be replayed.
+
+## [3.0.0-alpha.2] - 2026-07-16
+
+Follow-up to `3.0.0-alpha.1` that finalises the v3 API surface and fixes a batch of issues found in review.
+
+### Added
+- `RecordID`, `Table`, `Duration`, `Range`, and all `Geometry` types are now hashable, so they can be used as `dict` keys and `set` members.
+- `Datetime` gained `__eq__`, `__repr__`, and `__hash__`, making it a proper value type.
+- `.first()` on the query builder (async coroutine / sync method), returning the first statement's result, or `None` when there are no statements.
+- Exported `AsyncSurrealConnection` and `BlockingSurrealConnection` union type aliases for annotating connection instances.
+- HTTP connections implement `close()` and reuse a single pooled session across requests within a context manager.
+- README "Live queries" section documenting `live()` / `subscribe_live()` / `kill()`, and a pointer to the Spectron client.
+- Docstrings on the public CRUD / query / select / live-query methods.
+
+### Changed
+- **Breaking:** Sync `select`, `create`, `update`, `upsert`, `delete`, and `insert` are now **eager**. `select(...)` and `delete(...)` run immediately and return the result. `create/update/upsert(record, data)` and `insert(table, data)` run immediately and return the result; the no-data form (`create(record)`, `insert(table)`) returns a builder whose clause methods (`.content` / `.replace` / `.merge` / `.patch` / `.relation`) and `.execute()` run the operation and return the result. This removes the sync magic-consumption footguns (`bool()`, `==`, indexing, `__getattr__`) present in alpha.1.
+- **Breaking:** Sync builders no longer implement any auto-executing magic methods (`__bool__`, `__eq__`, `__getitem__`, `__iter__`, `__len__`, `__contains__`, `__getattr__`, and the pending-`repr`/`str`). Inspecting a builder never triggers a query or mutation.
+- **Breaking:** `query()` now **always** returns a `list[Value]` (one entry per statement) — even for a single statement — for both async (`await db.query(...)` / `.execute()`) and sync (`.execute()`). This supersedes the alpha.1 "single `Value` for one statement, `tuple` for many" behaviour. Use `.first()` for the first statement's result.
+- **Breaking:** `select(RecordID)` (or a single `"table:id"` string) now returns `dict[str, Value] | None` (the record, or `None` when it is absent) instead of a single-element list; `select(Table)` (or a bare table name) still returns `list[Value]`. `select()` is now typed via `@overload` on the templates, all four connections, and the session/transaction classes.
+- **Breaking:** The Spectron client is no longer re-exported from the top-level `surrealdb` package; import it from `surrealdb.spectron` (`from surrealdb.spectron import Spectron, AsyncSpectron`). This keeps the Spectron surface out of the core SDK's stability guarantee.
+- **Breaking:** `query_raw`'s bound-variable keyword argument is renamed from `params` to `vars`, matching `query`.
+- The session and transaction wrapper classes now carry the same CRUD `@overload` precision as the base connection.
+- Python `set` / `frozenset` now encode with SurrealDB's set tag (56) instead of the generic CBOR set tag (258).
+- `info()`'s record-auth `$auth` fallback is now applied consistently across all four transports and keyed on the structured error kind rather than the error-message text.
+
+### Removed
+- **Breaking:** The low-level `TAG_*` CBOR constants are no longer exported from the top-level `surrealdb` package; they remain available at `surrealdb.data.types.constants`.
+- Removed the unused `AsyncSurrealDBMeta` / `BlockingSurrealDBMeta` metaclasses and the dead duplicate `surrealdb.cbor` shim modules (`decoder`, `encoder`, `types`, `tool`).
+
+### Fixed
+- `RecordID.parse` (and `table_or_record_id`) no longer raise on record ids containing `:` (e.g. `"user:complex:id"`).
+- WebSocket live queries: `subscribe_live` generators are woken and cleaned up on `kill()` / `close()` instead of leaking; a mid-request disconnect raises a typed `ConnectionUnavailableError` instead of a bare `KeyError`; the blocking client correlates RPC replies by id (never returning a live notification as an RPC result), reads under its lock, and logs via `logging` instead of `print`.
+- Removed several unreachable encoder branches and a stale decoder `TODO` in the CBOR layer.
+
+## [3.0.0-alpha.1] - 2026-07-13
+### Added
+- New awaitable / lazy CRUD builder pattern. `create`, `update`, `upsert`, `delete`, and `insert` now return a builder that exposes chainable clause methods (`.content` / `.replace` / `.merge` / `.patch`) and is awaitable (async) or auto-executing on consumption (sync).
+- `.insert(table, data, relation=True)` (and the equivalent `.insert(table).relation().content(data)` chain) replaces the standalone `insert_relation` method.
+- New `run(name, args=None, version=None)` method on every connection / session / transaction, wired to the `RUN` RPC method.
+- `query().into(cls)` maps the N statement results positionally onto a dataclass (or any class accepting keyword arguments by parameter order).
+- New v3 API tests under `tests/unit_tests/connections/v3_api/` covering builder clauses, multi-statement query results, `.into()`, and `run()`.
+- Public re-exports of the builder classes (`AsyncCrudBuilder`, `AsyncInsertBuilder`, `AsyncQueryBuilder`, `AsyncQueryIntoBuilder`, and the `Sync*` equivalents) from `surrealdb`.
+- `QueryError.is_transaction_conflict` property, detecting `TRANSACTION_CONFLICT` query errors (#268).
+- `__str__` methods for `Datetime`, `Duration`, and all 7 `Geometry` classes, rendering SurrealQL literals instead of Python's default `repr` (#270).
+- Export `escape_identifier` from the top-level `surrealdb` package and document `RecordID.id`'s raw (unescaped) contract (#271).
+
+### Changed
+- **Breaking:** `query()` now surfaces every statement result. A single-statement query returns the result `Value`; a multi-statement query (or `BEGIN ... COMMIT` block) returns `tuple[Value, ...]`. Fixes the silent-discard behaviour reported in [#232](https://github.com/surrealdb/surrealdb.py/issues/232).
+- **Breaking:** Sync `query()` / CRUD methods return a lazy builder. The operation runs when the result is consumed (indexed, iterated, compared, printed, etc.) or when `.execute()` is called explicitly. Fire-and-forget statements like `db.query("DELETE foo")` must call `.execute()` to run.
+- **Breaking:** `create`, `update`, `upsert`, `delete`, and `insert` are typed via `@overload` so type checkers infer `dict[str, Value]` for `RecordID` targets and `list[Value]` for `Table` targets.
+- **Breaking:** Raw-string resource targets are now strictly validated against the safe-identifier pattern (`[A-Za-z_][A-Za-z0-9_]*`). Names with hyphens or other special characters must be wrapped in `Table(...)` or `RecordID(...)` so the SDK can safely route them through parameter binding (CRUD ops use `type::table($var)`) or SurrealQL's `⟨...⟩` escape (`INSERT`, where the server doesn't accept `type::table()`).
+- The session and transaction classes (`AsyncSurrealSession` / `BlockingSurrealSession`, `AsyncSurrealTransaction` / `BlockingSurrealTransaction`) expose the same builder API and forward `session_id` / `txn_id` through to every operation.
+
+### Removed
+- **Breaking:** `db.merge(record, data)` — use `db.update(record).merge(data)` (or `.create/.upsert(record).merge(data)`).
+- **Breaking:** `db.patch(record, data)` — use `db.update(record).patch(data)`.
+- **Breaking:** `db.insert_relation(table, data)` — use `db.insert(table, data, relation=True)` or `db.insert(table).relation().content(data)`.
+
+### Fixed
+- Restored the record-level auth fallback in `BlockingHttpSurrealConnection.info()`. When the server returned `No result found` from `INFO` (record-auth scenario), the SDK now retries via `SELECT * FROM $auth` and returns the resolved record; the fallback was inadvertently dead in the initial v3 builder migration because `query()` returns a lazy builder.
+- `Range.__str__` producing invalid SurrealQL (#269).
+
+## [2.0.1]
+### Changed
+- **Breaking:** WebSocket `subscribe_live()` now yields the full live-notification object (`action`, `result`, `id`, …) from the server instead of only the inner record ([#247](https://github.com/surrealdb/surrealdb.py/issues/247)).
+
+### Fixed
+- `subscribe_live` WebSocket tests perform mutations on a secondary connection so query RPC replies are not interleaved with live notifications on the same socket.
+
+## [2.0.0] - 2026-04-23
+### Added
+- Support `surrealkv+versioned://` URL scheme for embedded databases with versioning (#231).
+
+## [2.0.0-alpha.1] - 2026-02-25
+### Added
+- SurrealDB 3.x protocol and feature support (#230).
+- Structured error hierarchy and `ServerError` with SurrealDB 3.x–style kind/details (#233).
+- Logfire observability example and README section (#229).
+
+### Changed
+- Drop Python 3.9 support; minimum Python is 3.10 (#230).
+- Add release-comment workflow for builds (#240).
+
+### Fixed
+- Fix WebSocket session and transaction ID handling for `begin`/`commit`/`cancel` (#236).
+
+## [1.0.8] - 2026-01-07
+### Added
+- Add optional `pydantic` extra so `RecordID` fields validate and serialize cleanly in `BaseModel`s and JSON schema outputs.
+
+### Changed
+- Changed `cerberus` for `pydantic-core`.
+
+### Fixed
+- Improve build stability and ensure `musl-tools` is installed for Linux builds.
+
+## [1.0.7] - 2025-12-03
+### Added
+- Support compound duration parsing in `Duration.parse`.
+- Provide native embedded database support.
+- Add comprehensive framework integration examples.
+- Introduce `pyright` checks and additional data type coverage.
+- Expand test coverage for record IDs and Cursor tooling rules.
+
+### Changed
+- Simplify database method return types to `Value`.
+- Issue text-based queries instead of using v1 RPC methods.
+
+### Fixed
+- Correct Duration encoding and decoding.
+- Enforce GeoJSON-compliant closed linear rings in `GeometryPolygon`.
+- Escape string identifiers in `RecordID` to match SurrealDB behavior.
+- Fix `decimal.Decimal` encoding.
+- Address race condition in concurrent environments.
+- Apply formatting, linting, and test stability fixes.
+
+## [1.0.6] - 2025-07-21
+### Changed
+- Switch project management to `uv` and simplify the developer environment.
+
+## [1.0.5] - 2025-07-18
+### Changed
+- Streamline CI/build workflows and improve developer tooling.
+
+## [1.0.4] - 2025-05-21
+### Added
+- Add decimal support and CBOR integration improvements.
+
+### Fixed
+- Improve polygon handling and async WebSocket error handling.
+- Fix `None` encoding/decoding for SurrealDB v2.2.x and later.
+- Correct timezone offset decoding and types in connections.
+- Normalize error response handling.
+
+## [1.0.3] - 2025-02-04
+### Fixed
+- Correct datetime tagging.
+
+## [1.0.2] - 2025-02-02
+### Changed
+- Update project metadata.
+
+### Fixed
+- Remove WebSocket max message size limit.
+
+## [1.0.1] - 2025-02-01
+### Fixed
+- Resolve signup/signin issues and improve CI/test stability.
+
+## [1.0.0] - 2025-01-30
+### Added
+- Initial stable release of the SurrealDB Python client.
+
+[Unreleased]: https://github.com/surrealdb/surrealdb.py/compare/v3.0.1...HEAD
+[3.0.1]: https://github.com/surrealdb/surrealdb.py/compare/v3.0.0...v3.0.1
+[3.0.0]: https://github.com/surrealdb/surrealdb.py/compare/v3.0.0-beta.11...v3.0.0
+[3.0.0-beta.11]: https://github.com/surrealdb/surrealdb.py/compare/v3.0.0-beta.10...v3.0.0-beta.11
+[3.0.0-beta.10]: https://github.com/surrealdb/surrealdb.py/compare/v3.0.0-beta.9...v3.0.0-beta.10
+[3.0.0-beta.9]: https://github.com/surrealdb/surrealdb.py/compare/v3.0.0-beta.8...v3.0.0-beta.9
+[3.0.0-beta.8]: https://github.com/surrealdb/surrealdb.py/compare/v3.0.0-beta.7...v3.0.0-beta.8
+[3.0.0-beta.7]: https://github.com/surrealdb/surrealdb.py/compare/v3.0.0-beta.6...v3.0.0-beta.7
+[3.0.0-beta.6]: https://github.com/surrealdb/surrealdb.py/compare/v3.0.0-beta.5...v3.0.0-beta.6
+[3.0.0-beta.5]: https://github.com/surrealdb/surrealdb.py/compare/v3.0.0-beta.4...v3.0.0-beta.5
+[3.0.0-beta.4]: https://github.com/surrealdb/surrealdb.py/compare/v3.0.0-beta.3...v3.0.0-beta.4
+[3.0.0-beta.3]: https://github.com/surrealdb/surrealdb.py/compare/v3.0.0-beta.2...v3.0.0-beta.3
+[3.0.0-beta.2]: https://github.com/surrealdb/surrealdb.py/compare/v3.0.0-beta.1...v3.0.0-beta.2
+[3.0.0-beta.1]: https://github.com/surrealdb/surrealdb.py/compare/v3.0.0-alpha.4...v3.0.0-beta.1
+[3.0.0-alpha.4]: https://github.com/surrealdb/surrealdb.py/compare/v3.0.0-alpha.3...v3.0.0-alpha.4
+[3.0.0-alpha.3]: https://github.com/surrealdb/surrealdb.py/compare/v3.0.0-alpha.2...v3.0.0-alpha.3
+[3.0.0-alpha.2]: https://github.com/surrealdb/surrealdb.py/compare/v3.0.0-alpha.1...v3.0.0-alpha.2
+[3.0.0-alpha.1]: https://github.com/surrealdb/surrealdb.py/compare/v2.0.1...v3.0.0-alpha.1
+[2.0.1]: https://github.com/surrealdb/surrealdb.py/compare/v2.0.0...v2.0.1
+[2.0.0]: https://github.com/surrealdb/surrealdb.py/compare/v2.0.0-alpha.1...v2.0.0
+[2.0.0-alpha.1]: https://github.com/surrealdb/surrealdb.py/compare/v1.0.8...v2.0.0-alpha.1
+[1.0.8]: https://github.com/surrealdb/surrealdb.py/compare/v1.0.7...v1.0.8
+[1.0.7]: https://github.com/surrealdb/surrealdb.py/compare/v1.0.6...v1.0.7
+[1.0.6]: https://github.com/surrealdb/surrealdb.py/compare/v1.0.5...v1.0.6
+[1.0.5]: https://github.com/surrealdb/surrealdb.py/compare/v1.0.4...v1.0.5
+[1.0.4]: https://github.com/surrealdb/surrealdb.py/compare/v1.0.3...v1.0.4
+[1.0.3]: https://github.com/surrealdb/surrealdb.py/compare/v1.0.2...v1.0.3
+[1.0.2]: https://github.com/surrealdb/surrealdb.py/compare/v1.0.1...v1.0.2
+[1.0.1]: https://github.com/surrealdb/surrealdb.py/compare/v1.0.0...v1.0.1

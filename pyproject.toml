@@ -1,0 +1,406 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "surrealdb"
+version = "3.0.1"
+description = "SurrealDB python client"
+readme = "README.md"
+authors = [{ name = "SurrealDB" }]
+license = "Apache-2.0"
+keywords = ["SurrealDB", "Database"]
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+    "Topic :: Database :: Front-Ends",
+    "Topic :: Database :: Database Engines/Servers",
+    "Topic :: Software Development",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    # 3.14.0 is the first release carrying the fix for CVE-2026-34993
+    # (GHSA-jg22-mg44-37j8) in `CookieJar.load()`. The SDK never touches
+    # `CookieJar`, so the path is unreachable through it, but pulling the floor
+    # up keeps users off the affected range. 3.14 still supports Python 3.10,
+    # so this costs no platform coverage.
+    "aiohttp>=3.14.0",
+    # 2.10.0 is the first release whose `typed-dict` schema takes the
+    # `typed-dict-field` wrappers `cbor_ws` builds. Below it the module-scope
+    # `SchemaValidator` raises `SchemaError` on construction, so `import
+    # surrealdb` fails outright - the declared floor of 2.0.1 named a version
+    # at which the package could not be imported at all.
+    "pydantic-core>=2.10.0",
+    "requests>=2.25.0",
+    # `Buffer` (PEP 688) lands in 4.6.0. The import is `TYPE_CHECKING`-only, so
+    # an older version still runs - but this package ships `py.typed`, and a
+    # type checker resolving the SDK against 4.0.0 cannot find the name.
+    "typing_extensions>=4.6.0; python_version<'3.12'",
+    # `websockets.sync`, which the whole blocking transport is built on, only
+    # exists from 11.0 - so the declared floor of 10.0 was another version at
+    # which importing the package failed. 11.0 imports but deadlocks: its
+    # message assembler blocks the reader thread until an unread frame is
+    # consumed, and `close()` joins that thread, so closing a connection with
+    # an undelivered live notification never returns. 12.0 through 13.1 avoid
+    # the deadlock but still pay the full 10s close timeout for it. 14.0 is the
+    # first release where closing such a connection is immediate, and 14.1 the
+    # first to expose `ClientConnection.state` - which is how the blocking
+    # transport tells a live socket from one whose peer has gone away, so that
+    # `connect()` can replace it rather than returning on a dead connection.
+    # 15.0 is the first release whose *sync* client takes `ping_interval` and
+    # `ping_timeout` at all - the async one has had them throughout, so passing
+    # them on 14.x raised `TypeError: connect() got an unexpected keyword
+    # argument` and took every blocking websocket connection with it.
+    "websockets>=15.0",
+]
+
+[project.urls]
+homepage = "https://github.com/surrealdb/surrealdb.py"
+repository = "https://github.com/surrealdb/surrealdb.py"
+documentation = "https://surrealdb.com/docs/sdk/python"
+
+[project.optional-dependencies]
+embedded = [
+    "surrealdb-embedded==3.0.1",
+]
+pydantic = [
+    "pydantic>=2.13.5",
+]
+memory = [
+    # `>=`, deliberately, unlike `embedded`'s exact pin above. The memory client
+    # shares no code with this SDK - it speaks HTTP to a separate service - so it
+    # is free to move across its own majors while the SDK stays where it is. An
+    # `==` pin here would re-weld the release cadences that splitting it apart
+    # was meant to separate.
+    # `>=1.0.0b1`, not `>=1.0`. A specifier that does not itself name a
+    # pre-release excludes them, so `>=1.0` would find no candidate at all while
+    # the memory client is on its beta line - `surrealdb[memory]` would fail to
+    # resolve rather than degrade. The floor keeps matching every later stable,
+    # so it does not need revisiting when 1.0.0 final lands.
+    "surrealdb-memory>=1.0.0b1",
+]
+
+[dependency-groups]
+dev = [
+    { include-group = "test" },
+    "surrealdb[memory,pydantic]",
+    "maturin>=1.15.0",
+    "mypy>=2.4.0",
+    "pyright>=1.1.414",
+    "ruff>=0.16.10",
+    "types-requests>=2.33.0.20261006",   # Type stubs for requests
+    "types-pyyaml>=6.0.12",
+]
+test = [
+    "coverage>=7.16.2",
+    "hypothesis>=6.168.5",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
+    "pyyaml>=6.0.2",
+    "responses>=0.26.3",
+]
+
+# --------------------------------------------------
+# uv
+# --------------------------------------------------
+
+[tool.uv.sources]
+surrealdb-embedded = { path = "embedded", editable = true }
+surrealdb-memory = { path = "memory", editable = true }
+
+# --------------------------------------------------
+# hatch
+# --------------------------------------------------
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/surrealdb"]
+
+# Without this the sdist is the whole working tree - CI workflows, the Rust
+# crate for the separate `surrealdb-embedded` package, Docker files, editor
+# config. Ship what is needed to build the package and run its tests against
+# the source, which is what downstream packagers rebuild from.
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+]
+
+# --------------------------------------------------
+# ruff
+# --------------------------------------------------
+
+[tool.ruff]
+# Markdown is excluded because ruff >= 0.16 formats Python code blocks inside
+# `.md` files, which reflows the hand-aligned examples in our docs (notably
+# `memory/README.md`). Docs prose is not formatter-owned.
+#
+# `src/surrealdb/__init__.py` used to be excluded here as well. That was
+# collateral from the markdown fix rather than a decision about the file, and it
+# exempted the package's own entry point - the most-read module in the project -
+# from both the linter and the formatter.
+exclude = ["*.md"]
+
+[tool.ruff.lint]
+# Setting `select` *replaces* ruff's default of `["E4", "E7", "E9", "F"]`, so
+# the previous `["I", "UP"]` silently turned pyflakes off: unused imports,
+# unused variables and undefined names were not being checked anywhere. The
+# defaults are named explicitly below so that cannot happen again by omission.
+select = [
+    "E4",  # pycodestyle: imports
+    "E7",  # pycodestyle: statements
+    "E9",  # pycodestyle: runtime errors
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "PIE", # flake8-pie
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific
+]
+ignore = [
+    # `⟨...⟩` is SurrealQL's identifier-escape syntax and `α`, `é`, `表格` are
+    # test data for it, so "did you mean the ASCII lookalike?" is exactly
+    # backwards here - the point of those characters is that they are not ASCII.
+    "RUF002", # ambiguous unicode in a docstring
+    "RUF003", # ambiguous unicode in a comment
+    # `__all__` is grouped by category with section comments (connections, data
+    # types, the error tree). Alphabetical order would scatter those groups for
+    # no reader's benefit.
+    "RUF022", # `__all__` is not sorted
+    # `assert 0 == len(x)` reads fine and there are ~90 of them in the tests.
+    # Rewriting every one is churn with no defect behind it.
+    "SIM300", # yoda condition
+]
+
+# `surrealdb_memory` is a separate distribution, so ruff would otherwise sort it
+# in with third-party imports - including inside `memory/`, where it is the
+# package under test. Declaring it keeps its own imports in the first-party
+# group, the way `surrealdb.spectron` was grouped before the split.
+[tool.ruff.lint.isort]
+known-first-party = ["surrealdb", "surrealdb_memory", "surrealdb_embedded"]
+
+[tool.ruff.lint.per-file-ignores]
+# `src/surrealdb/cbor/` is a vendored copy of cbor2, carrying local changes for
+# SurrealDB's tags. Restyling it to this project's taste would make every future
+# diff against upstream unreadable for no behavioural gain, so the opinionated
+# families are off there. The ones that catch actual defects - pyflakes,
+# pycodestyle, import order, pyupgrade - still apply, and it passes them.
+"src/surrealdb/cbor/**/*.py" = ["B", "C4", "PIE", "SIM", "RUF"]
+
+# --------------------------------------------------
+# mypy
+# --------------------------------------------------
+
+[tool.mypy]
+mypy_path = "src"
+explicit_package_bases = true
+
+# Import discovery
+namespace_packages = true
+follow_imports = "normal"
+
+# Type checking strictness
+check_untyped_defs = true
+disallow_any_generics = true
+disallow_incomplete_defs = true
+disallow_subclassing_any = true
+disallow_untyped_calls = true
+disallow_untyped_decorators = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+strict_equality = true
+warn_redundant_casts = true
+warn_return_any = false
+warn_unused_configs = true
+warn_unused_ignores = true
+
+# Error reporting
+show_error_context = true
+show_column_numbers = true
+show_error_codes = true
+pretty = true
+
+# Incremental mode
+incremental = true
+cache_dir = ".mypy_cache"
+
+# Platform configuration
+python_version = "3.13"
+
+# Third-party library stubs
+[[tool.mypy.overrides]]
+module = "surrealdb_embedded.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "aiohttp.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "websockets.*"
+ignore_missing_imports = true
+
+# Relax type checking for tests - they work with Value union types extensively
+[[tool.mypy.overrides]]
+module = "tests.*"
+# Disable strict type checking for test bodies but keep what we can
+disallow_untyped_calls = false
+disallow_any_generics = false
+# Allow flexible indexing since query() returns Value union type
+warn_return_any = false
+# Don't warn about type narrowing issues
+strict_optional = false
+# Only these three codes remain suppressed because the public `Value` union is
+# indexed into pervasively across the test suite (~3,700 sites) - the resulting
+# index/union-attr/call-overload noise has no bug-catching value and enabling it
+# would mean rewriting test result handling rather than a config change. Every
+# other error code is now enabled, so `mypy tests/` guards against public-API
+# type regressions.
+disable_error_code = ["index", "union-attr", "call-overload"]
+
+# --------------------------------------------------
+# pyright
+# --------------------------------------------------
+
+[tool.pyright]
+# Python version
+pythonVersion = "3.13"
+
+# Type checking mode
+typeCheckingMode = "strict"
+
+# Source configuration
+include = ["src"]
+extraPaths = ["embedded/src", "memory/src"]
+exclude = [
+    "**/__pycache__",
+    "**/.pytest_cache",
+    "**/build",
+    "**/dist",
+    "**/.mypy_cache",
+]
+
+# Strict type checking settings (matching mypy configuration)
+strictListInference = true
+strictDictionaryInference = true
+strictSetInference = true
+strictParameterNoneValue = true
+
+# Report settings
+reportMissingTypeStubs = false
+reportMissingImports = true
+reportUnusedImport = true
+reportUnusedClass = true
+reportUnusedFunction = true
+reportUnusedVariable = true
+reportDuplicateImport = true
+reportOptionalSubscript = true
+reportOptionalMemberAccess = true
+reportOptionalCall = true
+reportOptionalIterable = true
+reportOptionalContextManager = true
+reportOptionalOperand = true
+reportTypedDictNotRequiredAccess = false
+reportUntypedFunctionDecorator = true
+reportUntypedClassDecorator = true
+reportUntypedBaseClass = true
+reportUntypedNamedTuple = true
+reportPrivateUsage = true
+reportConstantRedefinition = true
+reportIncompatibleMethodOverride = true
+reportIncompatibleVariableOverride = true
+reportInconsistentConstructor = true
+reportOverlappingOverload = true
+reportMissingSuperCall = false
+reportUninitializedInstanceVariable = true
+reportInvalidStringEscapeSequence = true
+reportUnknownParameterType = true
+reportUnknownArgumentType = false
+reportUnknownLambdaType = true
+reportUnknownVariableType = false
+reportUnknownMemberType = false
+reportMissingParameterType = true
+reportMissingTypeArgument = true
+reportInvalidTypeVarUse = true
+reportCallInDefaultInitializer = true
+reportUnnecessaryIsInstance = true
+reportUnnecessaryCast = true
+reportUnnecessaryComparison = true
+reportAssertAlwaysTrue = true
+reportSelfClsParameterName = true
+reportImplicitStringConcatenation = false
+reportUndefinedVariable = true
+reportUnboundVariable = true
+reportInvalidStubStatement = true
+reportIncompleteStub = true
+reportUnsupportedDunderAll = true
+reportUnusedCoroutine = true
+reportCallIssue = false
+reportAttributeAccessIssue = false
+reportArgumentType = false
+reportGeneralTypeIssues = false
+
+# --------------------------------------------------
+# pytest
+# --------------------------------------------------
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+markers = [
+    "surrealdb_v3: tests that require a running SurrealDB 3.x server (skipped otherwise)",
+    "slow: live-server tests that wait out deliberate delays; deselect with -m 'not slow'",
+    "network: tests that need a running SurrealDB server; deselect with -m 'not network'",
+]
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+    "--verbose",
+    "--tb=short",
+]
+filterwarnings = [
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+]
+
+# --------------------------------------------------
+# coverage
+# --------------------------------------------------
+
+[tool.coverage.run]
+source = ["src"]
+omit = [
+    "*/tests/*",
+    "*/test_*",
+    "*/__pycache__/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "if settings.DEBUG",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if 0:",
+    "if __name__ == .__main__.:",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod",
+]

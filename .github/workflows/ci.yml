@@ -1,0 +1,523 @@
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - "*"
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  format:
+    name: Check format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      # `./src ./tests` - both. Pointing ruff at `./src` alone meant the test
+      # suite was linted and formatted by nothing, and it had accumulated
+      # unused imports, unused variables, `type(x) == y` comparisons and two
+      # files the formatter would have rewritten.
+      - name: Run ruff checks
+        uses: astral-sh/ruff-action@278981a28ce3188b1e39527901f38254bf3aac89 # v4
+        with:
+          src: "./src ./tests ./memory"
+          version-file: "uv.lock"
+
+      - name: Run ruff format checks
+        uses: astral-sh/ruff-action@278981a28ce3188b1e39527901f38254bf3aac89 # v4
+        with:
+          src: "./src ./tests ./memory"
+          version-file: "uv.lock"
+          args: "format --check --diff"
+
+  mypy:
+    name: Check mypy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Run mypy checks
+        run: uv run mypy --explicit-package-bases src/
+
+      - name: Run mypy checks
+        run: uv run mypy --explicit-package-bases tests/
+
+      - name: Run mypy checks (agent memory)
+        run: uv run mypy --explicit-package-bases -p surrealdb_memory
+
+  pyright:
+    name: Check pyright
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Run pyright checks
+        run: uv run pyright src/ tests/unit_tests/test_builder_row_typing.py
+
+      - name: Run pyright checks (agent memory)
+        run: uv run pyright memory/src
+
+  package:
+    name: Check packaging (py.typed)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.13"
+
+      # `uv sync` resolves and installs without complaining that the lockfile
+      # disagrees with pyproject.toml, so a dependency change that skipped
+      # `uv lock` went green everywhere and only surfaced at release time, when
+      # the release PR refreshes the lock and picks up someone else's edit.
+      - name: Assert uv.lock is up to date with pyproject.toml
+        run: uv lock --check
+
+      - name: Build wheel
+        run: uv build --wheel
+
+      - name: Assert py.typed ships in the wheel (PEP 561)
+        run: |
+          wheel=$(ls dist/*.whl)
+          echo "Inspecting $wheel"
+          if unzip -l "$wheel" | grep -q 'surrealdb/py.typed'; then
+            echo "OK: surrealdb/py.typed is present in the wheel"
+          else
+            echo "ERROR: surrealdb/py.typed is missing from the wheel; PEP 561 type information would not ship to users"
+            unzip -l "$wheel"
+            exit 1
+          fi
+
+      # The embedded package ships hand-written stubs (_ext.pyi) for the native
+      # module, but PEP 561 says a type checker must ignore them unless the
+      # package is also marked. This is a source-tree check rather than a wheel
+      # check because building that wheel needs a full Rust release build;
+      # maturin includes the whole `python-source` package directory, so the
+      # marker existing here is what puts it in the wheel.
+      - name: Assert py.typed is present in the embedded package (PEP 561)
+        run: |
+          if [ -f embedded/src/surrealdb_embedded/py.typed ]; then
+            echo "OK: embedded/src/surrealdb_embedded/py.typed is present"
+          else
+            echo "ERROR: py.typed is missing, so the _ext.pyi stubs would be ignored by type checkers"
+            exit 1
+          fi
+
+  # Every other job installs the lockfile, which pins current versions - so
+  # nothing here has ever exercised the *declared* minimums. Two of them named
+  # versions at which `import surrealdb` raised, and both shipped.
+  #
+  # Deliberately runs the built wheel out of site-packages with no PYTHONPATH:
+  # the point is what a user gets from `pip install surrealdb`, resolved the
+  # way a user with old pins would resolve it.
+  floors:
+    name: Minimum declared dependency versions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "latest"
+          enable-cache: true
+
+      # The oldest interpreter we support: the one a user still on old pins is
+      # most likely to be running, and the one old dependencies have wheels for.
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.10"
+
+      - name: Install surrealdb
+        run: curl -sSf https://install.surrealdb.com | sh -s -- --version v3.0.5
+
+      - name: Start surrealdb
+        run: surreal start --allow-all -u root -p root --log trace &
+        # Buckets are gated behind an experimental capability, so without this
+        # the file tests skip rather than run - and a skipped test is not a
+        # passing one. Servers too old to know the flag ignore it, and the tests
+        # detect the capability rather than the version, so they still skip
+        # cleanly on 2.x.
+        env:
+          SURREAL_CAPS_ALLOW_EXPERIMENTAL: files
+
+      - name: Wait for startup
+        run: sleep 5
+
+      - name: Build wheel
+        run: uv build --wheel
+
+      # Resolved from pyproject.toml rather than repeated here, so the job
+      # cannot drift from what is declared. `lowest-direct` pins our own
+      # dependencies to their floors while letting everything they pull in
+      # resolve normally - which is what a user with no pins of their own gets,
+      # not an artificial combination no resolver would produce.
+      - name: Resolve the declared floors
+        run: |
+          # Explicit, so the resolve cannot silently land on a different
+          # interpreter than the one the tests then run under - the markers on
+          # some dependencies are keyed to the Python version.
+          uv venv --python 3.10 .floors
+          uv pip compile --python .floors/bin/python \
+            --resolution lowest-direct pyproject.toml -o floor-lock.txt
+          echo "Floors under test:"
+          grep -vE '^\s*#|^$' floor-lock.txt
+
+      # The lock goes in as a *constraint*, so the test tools resolve normally
+      # while every dependency of the SDK is held at its floor.
+      - name: Install the wheel at those floors
+        run: |
+          uv pip install --python .floors/bin/python --constraint floor-lock.txt \
+            dist/*.whl pytest pytest-asyncio hypothesis responses coverage
+          uv pip list --python .floors/bin/python
+
+      - name: Run unit tests against the floors
+        run: .floors/bin/python -m pytest --ignore=tests/unit_tests/connections/embedded
+        env:
+          PYTHONWARNINGS: ignore::ResourceWarning
+
+  test:
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.surrealdb-version == 'nightly' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        # v3.3.0 is the GA release of the `query_stream` protocol this client
+        # implements - the method landed in beta.1 and the `begin` frame's
+        # `version` field in beta.3. It is what makes the streaming tests run
+        # rather than skip; `nightly` covers it too but is `continue-on-error`,
+        # so the pin is what actually gates.
+        surrealdb-version: ["v2.0.5", "v2.1.9", "v2.2.8", "v2.3.10", "v3.0.5", "v3.3.0", "nightly"]
+    name: Core Tests - Python ${{ matrix.python-version }} - SurrealDB ${{ matrix.surrealdb-version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install surrealdb
+        run: |
+          if [ "${{ matrix.surrealdb-version }}" = "nightly" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://install.surrealdb.com | sh -s -- --nightly
+          else
+            curl -sSf https://install.surrealdb.com | sh -s -- --version ${{ matrix.surrealdb-version }}
+          fi
+
+      - name: Start surrealdb
+        run: surreal start --allow-all -u root -p root --log trace &
+        # Buckets are gated behind an experimental capability, so without this
+        # the file tests skip rather than run - and a skipped test is not a
+        # passing one. Servers too old to know the flag ignore it, and the tests
+        # detect the capability rather than the version, so they still skip
+        # cleanly on 2.x.
+        env:
+          SURREAL_CAPS_ALLOW_EXPERIMENTAL: files
+
+      - name: Wait for startup
+        run: sleep 5
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      # Both transports are covered by one run: every transport has its own
+      # test files, and each builds its own connection. This step used to be
+      # two, labelled (HTTP) and (WebSocket), running the identical command and
+      # differing only by `SURREALDB_URL` - which nothing outside `examples/`
+      # has ever read, so both ran the whole suite over both transports. The
+      # step below asserts that coverage rather than assuming it.
+      - name: Check both transports are covered
+        run: |
+          status=0
+          for transport in async_http blocking_http async_ws blocking_ws; do
+            # Counted first: GNU xargs runs the command even on empty input,
+            # so a transport with no files at all would otherwise collect the
+            # whole suite and look covered.
+            found=$(find tests/unit_tests -name "test_$transport.py" \
+              -not -path '*/connections/embedded/*' | wc -l | tr -d ' ')
+            if [ "$found" -eq 0 ]; then
+              echo "::error::no test_$transport.py files found"
+              status=1
+              continue
+            fi
+            # `--verbose` is in addopts, so the count sits in a line of `=`
+            # padding rather than at the start of one.
+            count=$(find tests/unit_tests -name "test_$transport.py" \
+              -not -path '*/connections/embedded/*' -print0 \
+              | xargs -0 uv run pytest --collect-only -q 2>/dev/null \
+              | grep -oE '[0-9]+ tests? collected' | grep -oE '[0-9]+')
+            echo "$transport: ${count:-0} tests across $found files"
+            if [ "${count:-0}" -eq 0 ]; then
+              echo "::error::$transport collected no tests"
+              status=1
+            fi
+          done
+          exit $status
+        env:
+          PYTHONPATH: ./src
+
+      - name: Fetch the protocol vectors
+        run: ./scripts/protocol-vectors.sh
+
+      - name: Run unit tests
+        run: uv run pytest --ignore=tests/unit_tests/connections/embedded
+        env:
+          PYTHONPATH: ./src
+          # The suite builds its URLs from these two. `SURREALDB_URL` is read
+          # only by the examples, so setting that alone pointed nothing
+          # anywhere - the tests reached the server because the defaults
+          # happened to match.
+          SURREALDB_HOST: localhost
+          SURREALDB_PORT: "8000"
+          SURREALDB_VERSION: ${{ matrix.surrealdb-version }}
+          # What this server must do about streaming (v3.3.0 and later: stream).
+          # The streaming tests skip themselves on a server that refuses, which
+          # is also what a regression looks like - so on a leg that must stream,
+          # a refusal fails them instead, and on one that must not, the
+          # fallback is asserted. See tests/.../query_stream/expectation.py.
+          SURREALDB_EXPECT_STREAMING: ${{ (matrix.surrealdb-version == 'v3.3.0' || matrix.surrealdb-version == 'nightly') && '1' || '0' }}
+          PYTHONWARNINGS: ignore::ResourceWarning
+
+  # The shared conformance suite from surrealdb-protocol, at the release
+  # pinned in tests/unit_tests/conformance/vectors/VERSION, run through this
+  # SDK's driver (conformance/driver.py). Scenarios needing an op the SDK
+  # has no API for skip; only failures fail the job.
+  conformance:
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.surrealdb-version == 'nightly' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        surrealdb-version: ["v3.3.4", "nightly"]
+    name: Conformance - SurrealDB ${{ matrix.surrealdb-version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # The release is spelled out, not read from vectors/VERSION, so the code
+      # this job runs is fixed in the workflow; this step keeps the two in step.
+      - name: Check the surrealdb-protocol release
+        run: test "$(cat tests/unit_tests/conformance/vectors/VERSION)" = v0.15.0
+
+      - name: Checkout surrealdb-protocol
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: surrealdb/surrealdb-protocol
+          ref: v0.15.0
+          path: surrealdb-protocol
+          persist-credentials: false
+
+      # No cache: this job runs code from another repository, which must not
+      # be able to write a cache that other jobs restore.
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "latest"
+          enable-cache: false
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.13"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          no-cache: true
+
+      - name: Install surrealdb
+        run: |
+          if [ "${{ matrix.surrealdb-version }}" = "nightly" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://install.surrealdb.com | sh -s -- --nightly
+          else
+            curl -sSf https://install.surrealdb.com | sh -s -- --version ${{ matrix.surrealdb-version }}
+          fi
+          echo "SURREAL_BIN=$(command -v surreal)" >>"$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Run the conformance suite
+        working-directory: surrealdb-protocol
+        # The filter leaves out the one scenario written for plain-cbor clients:
+        # this SDK speaks cbor.2 to a server that offers it, and so receives
+        # sized numbers unwidened, as the suite's README says it should.
+        run: |
+          bun install --frozen-lockfile
+          bun conformance/runner/cli.ts \
+            --driver "uv run --project $GITHUB_WORKSPACE python $GITHUB_WORKSPACE/conformance/driver.py" \
+            --filter '^(?!query-sized-numbers-widen-over-plain-cbor$)' \
+            --report "$RUNNER_TEMP/conformance.json"
+        env:
+          PYTHONPATH: ${{ github.workspace }}/src:${{ github.workspace }}
+
+  test-memory:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    name: Memory Tests - Python ${{ matrix.python-version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      # The addon's own suite. It needs no server and no SurrealDB: the client
+      # speaks HTTP to a separate service, and the tests mock it.
+      - name: Run memory tests
+        run: uv run pytest memory/tests
+
+      # The other half of the split lives in the SDK's suite - that
+      # `surrealdb.memory` forwards to this package, and degrades with an
+      # actionable error when it is absent.
+      - name: Run the shim tests
+        run: uv run pytest tests/unit_tests/test_memory_shim.py
+
+      # `surrealdb[memory]` must be installable from the built artifacts, not
+      # just from the editable path dependency used above.
+      - name: Assert the built wheel carries the extra
+        run: |
+          pip install build
+          python -m build --wheel --outdir /tmp/wheel-core .
+          python -m build --wheel --outdir /tmp/wheel-memory memory
+          python - <<'EOF'
+          import glob, zipfile, sys
+          whl = glob.glob("/tmp/wheel-core/*.whl")[0]
+          meta = zipfile.ZipFile(whl).read(
+              [n for n in zipfile.ZipFile(whl).namelist() if n.endswith("METADATA")][0]
+          ).decode()
+          assert "Provides-Extra: memory" in meta, "the wheel lost the memory extra"
+          line = next(
+              l for l in meta.splitlines()
+              if l.startswith("Requires-Dist: surrealdb-memory")
+          )
+          assert 'extra == "memory"' in line or "extra == 'memory'" in line, line
+          assert "==" not in line.split(";")[0], f"must not pin exactly: {line}"
+          print("OK:", line)
+          EOF
+
+  test-embedded:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    name: Embedded Tests - Python ${{ matrix.python-version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Setup Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Build and install embedded extension
+        run: uv run maturin develop --release --manifest-path embedded/Cargo.toml
+
+      - name: Run embedded tests
+        run: uv run pytest tests/unit_tests/connections/embedded
+        env:
+          PYTHONPATH: ./src
+          PYTHONWARNINGS: ignore::ResourceWarning

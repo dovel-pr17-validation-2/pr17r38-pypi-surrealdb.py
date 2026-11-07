@@ -1,0 +1,83 @@
+import pytest
+
+from surrealdb import StringRecordId
+from surrealdb.connections.blocking_ws import BlockingWsSurrealConnection
+from surrealdb.data.types.record_id import RecordID
+from surrealdb.data.types.table import Table
+
+
+@pytest.fixture
+def record_id() -> RecordID:
+    return RecordID("user", "tobie")
+
+
+def test_delete_string(
+    blocking_ws_connection: BlockingWsSurrealConnection, record_id: RecordID
+) -> None:
+    blocking_ws_connection.query("DELETE user;").execute()
+    blocking_ws_connection.query("CREATE user:tobie SET name = 'Tobie';").execute()
+
+    # Delete operation returns the deleted record
+    outcome = blocking_ws_connection.delete(StringRecordId("user:tobie")).execute()
+    assert outcome is not None
+    assert outcome["id"] == record_id
+    assert outcome["name"] == "Tobie"
+
+    # Verify the record was actually deleted
+    remaining = blocking_ws_connection.query("SELECT * FROM user;").first()
+    assert remaining == []
+
+
+def test_delete_record_id(
+    blocking_ws_connection: BlockingWsSurrealConnection, record_id: RecordID
+) -> None:
+    blocking_ws_connection.query("DELETE user;").execute()
+    blocking_ws_connection.query("CREATE user:tobie SET name = 'Tobie';").execute()
+
+    # Delete operation returns the deleted record
+    outcome = blocking_ws_connection.delete(record_id).execute()
+    assert outcome is not None
+    assert outcome["id"] == record_id
+    assert outcome["name"] == "Tobie"
+
+    # Verify the record was actually deleted
+    remaining = blocking_ws_connection.query("SELECT * FROM user;").first()
+    assert remaining == []
+
+
+def test_delete_record_id_absent(
+    blocking_ws_connection: BlockingWsSurrealConnection,
+) -> None:
+    blocking_ws_connection.query("DELETE user;").execute()
+
+    # Deleting an absent record returns None (matching select).
+    outcome = blocking_ws_connection.delete(RecordID("user", "missing")).execute()
+    assert outcome is None
+
+
+def test_delete_string_absent(
+    blocking_ws_connection: BlockingWsSurrealConnection,
+) -> None:
+    blocking_ws_connection.query("DELETE user;").execute()
+
+    # Deleting an absent "table:id" record returns None (matching select).
+    outcome = blocking_ws_connection.delete(StringRecordId("user:missing")).execute()
+    assert outcome is None
+
+
+def test_delete_table(blocking_ws_connection: BlockingWsSurrealConnection) -> None:
+    blocking_ws_connection.query("DELETE user;").execute()
+    blocking_ws_connection.query("CREATE user:tobie SET name = 'Tobie';").execute()
+    blocking_ws_connection.query("CREATE user:jaime SET name = 'Jaime';").execute()
+
+    # Delete all users in the table
+    table = Table("user")
+    outcome = blocking_ws_connection.delete(table).execute()
+    # Table delete returns list of deleted records
+    assert len(outcome) == 2
+    assert any(record["name"] == "Tobie" for record in outcome)
+    assert any(record["name"] == "Jaime" for record in outcome)
+
+    # Verify all records were deleted
+    remaining = blocking_ws_connection.query("SELECT * FROM user;").first()
+    assert remaining == []

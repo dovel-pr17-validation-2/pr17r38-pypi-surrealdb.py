@@ -1,0 +1,125 @@
+from collections.abc import Generator
+from typing import Any
+
+import pytest
+
+from surrealdb import StringRecordId
+from surrealdb.connections.blocking_ws import BlockingWsSurrealConnection
+from surrealdb.data.types.record_id import RecordID
+from surrealdb.data.types.table import Table
+
+
+@pytest.fixture
+def merge_data() -> dict[str, Any]:
+    return {
+        "name": "Jaime",
+        "email": "jaime@example.com",
+        "password": "password456",
+        "enabled": True,
+    }
+
+
+@pytest.fixture(autouse=True)
+def setup_user(
+    blocking_ws_connection: BlockingWsSurrealConnection,
+) -> Generator[None, None, None]:
+    blocking_ws_connection.query("DELETE user;").execute()
+    blocking_ws_connection.query(
+        "CREATE user:tobie SET name = 'Tobie', email = 'tobie@example.com', password = 'password123', enabled = true;"
+    ).execute()
+    yield
+    blocking_ws_connection.query("DELETE user;").execute()
+
+
+def test_merge_string(
+    blocking_ws_connection: BlockingWsSurrealConnection, setup_user: None
+) -> None:
+    record_id = RecordID("user", "tobie")
+    outcome = blocking_ws_connection.update(StringRecordId("user:tobie")).merge({})
+    assert outcome["id"] == record_id
+    assert outcome["name"] == "Tobie"
+    result = blocking_ws_connection.query("SELECT * FROM user;").first()
+    assert result[0]["id"] == record_id
+    assert result[0]["name"] == "Tobie"
+
+
+def test_merge_string_with_data(
+    blocking_ws_connection: BlockingWsSurrealConnection,
+    merge_data: dict[str, Any],
+    setup_user: None,
+) -> None:
+    record_id = RecordID("user", "tobie")
+    first_outcome = blocking_ws_connection.update(StringRecordId("user:tobie")).merge(
+        merge_data
+    )
+    assert first_outcome["id"] == record_id
+    assert first_outcome["name"] == "Jaime"
+    assert first_outcome["email"] == "jaime@example.com"
+    assert first_outcome["enabled"] is True
+    result = blocking_ws_connection.query("SELECT * FROM user;").first()
+    assert result[0]["id"] == record_id
+    assert result[0]["name"] == "Jaime"
+    assert result[0]["email"] == "jaime@example.com"
+    assert result[0]["enabled"] is True
+
+
+def test_merge_record_id(
+    blocking_ws_connection: BlockingWsSurrealConnection, setup_user: None
+) -> None:
+    record_id = RecordID("user", "tobie")
+    first_outcome = blocking_ws_connection.update(record_id).merge({})
+    assert first_outcome["id"] == record_id
+    assert first_outcome["name"] == "Tobie"
+    result = blocking_ws_connection.query("SELECT * FROM user;").first()
+    assert result[0]["id"] == record_id
+    assert result[0]["name"] == "Tobie"
+
+
+def test_merge_record_id_with_data(
+    blocking_ws_connection: BlockingWsSurrealConnection,
+    merge_data: dict[str, Any],
+    setup_user: None,
+) -> None:
+    record_id = RecordID("user", "tobie")
+    outcome = blocking_ws_connection.update(record_id).merge(merge_data)
+    assert outcome["id"] == record_id
+    assert outcome["name"] == "Jaime"
+    assert outcome["email"] == "jaime@example.com"
+    assert outcome["enabled"] is True
+    result = blocking_ws_connection.query("SELECT * FROM user;").first()
+    assert result[0]["id"] == record_id
+    assert result[0]["name"] == "Jaime"
+    assert result[0]["email"] == "jaime@example.com"
+    assert result[0]["enabled"] is True
+
+
+def test_merge_table(
+    blocking_ws_connection: BlockingWsSurrealConnection, setup_user: None
+) -> None:
+    table = Table("user")
+    record_id = RecordID("user", "tobie")
+    first_outcome = blocking_ws_connection.update(table).merge({})
+    assert first_outcome[0]["id"] == record_id
+    assert first_outcome[0]["name"] == "Tobie"
+    result = blocking_ws_connection.query("SELECT * FROM user;").first()
+    assert result[0]["id"] == record_id
+    assert result[0]["name"] == "Tobie"
+
+
+def test_merge_table_with_data(
+    blocking_ws_connection: BlockingWsSurrealConnection,
+    merge_data: dict[str, Any],
+    setup_user: None,
+) -> None:
+    table = Table("user")
+    record_id = RecordID("user", "tobie")
+    outcome = blocking_ws_connection.update(table).merge(merge_data)
+    assert outcome[0]["id"] == record_id
+    assert outcome[0]["name"] == "Jaime"
+    assert outcome[0]["email"] == "jaime@example.com"
+    assert outcome[0]["enabled"] is True
+    result = blocking_ws_connection.query("SELECT * FROM user;").first()
+    assert result[0]["id"] == record_id
+    assert result[0]["name"] == "Jaime"
+    assert result[0]["email"] == "jaime@example.com"
+    assert result[0]["enabled"] is True

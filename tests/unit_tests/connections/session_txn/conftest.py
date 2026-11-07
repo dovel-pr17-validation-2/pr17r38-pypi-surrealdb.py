@@ -1,0 +1,97 @@
+"""
+Fixtures for multi-session and client-side transaction tests.
+
+These tests require a running SurrealDB 3.x instance with session and
+transaction support (e.g. start with SURREALDB_VERSION=v3.0.0-beta.2 or use
+docker-compose profile v3). They are skipped when the server version is not 3.x
+or when session-scoped create/query return empty.
+"""
+
+import contextlib
+from typing import Any
+
+import pytest
+
+from surrealdb import StringRecordId
+from surrealdb.connections.blocking_ws import BlockingWsSurrealConnection
+
+pytestmark = pytest.mark.surrealdb_v3
+
+
+def _is_surrealdb_v3(version_str: str) -> bool:
+    version_str = (version_str or "").strip().lower()
+    if not version_str:
+        return False
+    if version_str.startswith(("3.", "v3.")):
+        return True
+    return "surrealdb-3." in version_str
+
+
+@pytest.fixture(autouse=True)
+def session_txn_requires_v3(
+    blocking_ws_connection: BlockingWsSurrealConnection,
+    connection_params: dict,
+) -> None:
+    try:
+        version = blocking_ws_connection.version()
+    except (OSError, ConnectionError) as e:
+        pytest.skip(
+            f"Session/transaction tests require a running SurrealDB server: {e}. "
+            "Start with SURREALDB_VERSION=v3.0.0-beta.2 or use docker-compose profile v3."
+        )
+    if not _is_surrealdb_v3(version):
+        pytest.skip(
+            f"Multi-session and client-side transactions require SurrealDB 3.x (server: {version}). "
+            "Start with SURREALDB_VERSION=v3.0.0-beta.2 or use docker-compose profile v3."
+        )
+    session = blocking_ws_connection.new_session()
+    session.use(
+        connection_params["namespace"],
+        connection_params["database_name"],
+    )
+    result = None
+    probe_error: Exception | None = None
+    try:
+        blocking_ws_connection.query(
+            "REMOVE TABLE IF EXISTS session_txn_probe;"
+        ).execute()
+        blocking_ws_connection.query(
+            "DEFINE TABLE session_txn_probe SCHEMALESS;"
+        ).execute()
+        try:
+            # The session inherits the connection's root auth (see
+            # new_session), so - like the actual tests - it does not sign in
+            # again. ``.first()`` returns the first statement's rows (a list of
+            # record dicts); ``.execute()`` would wrap that in an outer
+            # per-statement list, so the row check below would never see a dict.
+            session.create(StringRecordId("session_txn_probe:check"), {"probe": True})
+            result = session.query("SELECT * FROM session_txn_probe;").first()
+        except Exception as exc:
+            probe_error = exc
+    finally:
+        with contextlib.suppress(Exception):
+            session.close_session()
+        blocking_ws_connection.query(
+            "REMOVE TABLE IF EXISTS session_txn_probe;"
+        ).execute()
+    if probe_error is not None:
+        pytest.skip(
+            "Session-scoped create/query failed "
+            f"({type(probe_error).__name__}: {probe_error}); ensure SurrealDB 3.x with session support."
+        )
+    if not result or not any(
+        r.get("probe") is True for r in result if isinstance(r, dict)
+    ):
+        pytest.skip(
+            "Session-scoped create/query returned empty; ensure SurrealDB 3.x with session support."
+        )
+
+
+@pytest.fixture
+def ws_url(connection_params: dict[str, Any]) -> str:
+    return str(connection_params["ws_url"])
+
+
+@pytest.fixture
+def ns_db() -> tuple[str, str]:
+    return ("test_ns", "test_db")

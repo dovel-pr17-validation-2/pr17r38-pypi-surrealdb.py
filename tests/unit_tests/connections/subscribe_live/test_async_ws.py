@@ -1,0 +1,71 @@
+import asyncio
+from asyncio import TimeoutError
+from uuid import UUID
+
+import pytest
+
+from surrealdb.connections.async_ws import AsyncWsSurrealConnection
+from surrealdb.data import RecordID
+
+
+async def test_live_subscription(
+    async_ws_connection_with_user: AsyncWsSurrealConnection,
+    async_ws_connection_secondary: AsyncWsSurrealConnection,
+) -> None:
+    # Start the live query
+    query_uuid = await async_ws_connection_with_user.live("user")
+    assert isinstance(query_uuid, UUID)
+
+    # Start the live subscription
+    subscription = await async_ws_connection_with_user.subscribe_live(query_uuid)
+
+    # Second socket avoids QUERY responses racing with live notifications on one WS.
+    await async_ws_connection_secondary.query(
+        "CREATE user:jaime SET name = 'Jaime', email = 'jaime@example.com', password = 'password456', enabled = true;"
+    )
+
+    try:
+        update = await asyncio.wait_for(subscription.__anext__(), timeout=10)
+        assert update["action"] == "CREATE"
+        record = update["result"]
+        assert record["name"] == "Jaime"
+        assert record["id"] == RecordID("user", "jaime")
+    except TimeoutError:
+        pytest.fail("Timed out waiting for live subscription update")
+
+    await async_ws_connection_secondary.kill(query_uuid)
+
+    # Cleanup the subscription
+    await async_ws_connection_secondary.query("DELETE user;")
+
+
+async def test_live_subscription_via_query(
+    async_ws_connection_with_user: AsyncWsSurrealConnection,
+    async_ws_connection_secondary: AsyncWsSurrealConnection,
+) -> None:
+    # Start the live query using query() method
+    query_uuid = await async_ws_connection_with_user.query(
+        "LIVE SELECT * FROM user;"
+    ).first()
+    assert isinstance(query_uuid, UUID)
+
+    # Start the live subscription
+    subscription = await async_ws_connection_with_user.subscribe_live(query_uuid)
+
+    await async_ws_connection_secondary.query(
+        "CREATE user:john SET name = 'John', email = 'john@example.com', password = 'password123', enabled = true;"
+    )
+
+    try:
+        update = await asyncio.wait_for(subscription.__anext__(), timeout=10)
+        assert update["action"] == "CREATE"
+        record = update["result"]
+        assert record["name"] == "John"
+        assert record["id"] == RecordID("user", "john")
+    except TimeoutError:
+        pytest.fail("Timed out waiting for live subscription update")
+
+    await async_ws_connection_secondary.kill(query_uuid)
+
+    # Cleanup the subscription
+    await async_ws_connection_secondary.query("DELETE user;")

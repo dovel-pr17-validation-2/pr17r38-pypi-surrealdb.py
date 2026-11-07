@@ -1,0 +1,114 @@
+from collections.abc import Iterator
+from typing import Any
+
+import pytest
+
+from surrealdb.connections.blocking_ws import BlockingWsSurrealConnection
+from surrealdb.types import Value
+
+
+@pytest.fixture(autouse=True)
+def setup_blocking_ws_signin(
+    connection_params: dict[str, Any],
+) -> Iterator[dict[str, Any]]:
+    """Setup fixture for blocking WS signin tests"""
+    url = connection_params["ws_url"]
+    password = "root"
+    username = "root"
+    database_name = "test_db"
+    namespace = "test_ns"
+    vars_params: dict[str, Value] = {
+        "username": username,
+        "password": password,
+    }
+    connection = BlockingWsSurrealConnection(url)
+    _ = connection.signin(vars_params)
+    connection.use(namespace=namespace, database=database_name)
+    _ = connection.query_raw("DELETE user;")
+    _ = connection.query_raw("REMOVE TABLE user;")
+    connection.query(
+        "DEFINE TABLE user SCHEMAFULL PERMISSIONS FOR select, update, delete WHERE id = $auth.id;"
+        "DEFINE FIELD name ON user TYPE string;"
+        "DEFINE FIELD email ON user TYPE string;"
+        "DEFINE FIELD password ON user TYPE string;"
+        "DEFINE FIELD enabled ON user TYPE bool;"
+        "DEFINE INDEX email ON user FIELDS email UNIQUE;"
+    ).execute()
+    _ = connection.query_raw("REMOVE ACCESS user ON DATABASE;")
+    connection.query(
+        "DEFINE ACCESS user ON DATABASE TYPE RECORD "
+        "SIGNUP ( CREATE user SET name = $name, email = $email, password = crypto::argon2::generate($password), enabled = true ) "
+        "SIGNIN ( SELECT * FROM user WHERE email = $email AND crypto::argon2::compare(password, $password) );"
+    ).execute()
+    connection.query(
+        'DEFINE USER IF NOT EXISTS test ON NAMESPACE PASSWORD "test" ROLES OWNER; '
+        'DEFINE USER IF NOT EXISTS test ON DATABASE PASSWORD "test" ROLES OWNER;'
+    ).execute()
+    connection.query(
+        "CREATE user SET name = 'test', email = 'test@gmail.com', password = crypto::argon2::generate('test'), enabled = true"
+    ).execute()
+
+    yield {
+        "url": url,
+        "password": password,
+        "username": username,
+        "database_name": database_name,
+        "namespace": namespace,
+        "vars_params": vars_params,
+        "connection": connection,
+    }
+
+    connection.query_raw("DELETE user;")
+    connection.query_raw("REMOVE TABLE user;")
+    if connection.socket:
+        connection.socket.close()
+
+
+def test_signin_root(setup_blocking_ws_signin: dict[str, Any]) -> None:
+    connection = BlockingWsSurrealConnection(setup_blocking_ws_signin["url"])
+    response = connection.signin(setup_blocking_ws_signin["vars_params"])
+    assert response is not None
+    connection.close()
+
+
+def test_signin_namespace(setup_blocking_ws_signin: dict[str, Any]) -> None:
+    connection = BlockingWsSurrealConnection(setup_blocking_ws_signin["url"])
+    vars = {
+        "namespace": setup_blocking_ws_signin["namespace"],
+        "username": "test",
+        "password": "test",
+    }
+    response = connection.signin(vars)
+    assert response is not None
+    connection.close()
+
+
+def test_signin_database(setup_blocking_ws_signin: dict[str, Any]) -> None:
+    connection = BlockingWsSurrealConnection(setup_blocking_ws_signin["url"])
+    vars = {
+        "namespace": setup_blocking_ws_signin["namespace"],
+        "database": setup_blocking_ws_signin["database_name"],
+        "username": "test",
+        "password": "test",
+    }
+    response = connection.signin(vars)
+    assert response is not None
+    connection.close()
+
+
+def test_signin_record(setup_blocking_ws_signin: dict[str, Any]) -> None:
+    vars = {
+        "namespace": setup_blocking_ws_signin["namespace"],
+        "database": setup_blocking_ws_signin["database_name"],
+        "access": "user",
+        "variables": {"email": "test@gmail.com", "password": "test"},
+    }
+    connection = BlockingWsSurrealConnection(setup_blocking_ws_signin["url"])
+    response = connection.signin(vars)
+    assert response is not None
+
+    outcome = connection.info()
+    assert outcome["email"] == "test@gmail.com"
+    assert outcome["name"] == "test"
+
+    connection.close()

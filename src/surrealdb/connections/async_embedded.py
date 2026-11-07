@@ -1,0 +1,290 @@
+"""
+Async embedded SurrealDB connection using the Rust extension with CBOR messaging.
+"""
+
+from __future__ import annotations
+
+import uuid
+from collections.abc import AsyncGenerator
+from types import TracebackType
+from typing import Any
+from uuid import UUID
+
+from surrealdb.connections.async_ws import AsyncSurrealSession, AsyncWsSurrealConnection
+from surrealdb.connections.import_export import (
+    ExportOptions,
+    ExportTarget,
+    ImportData,
+)
+from surrealdb.connections.live import AsyncLiveSubscription
+from surrealdb.connections.url import Url
+from surrealdb.connections.utils_mixin import mapped_engine_errors
+from surrealdb.data.cbor import decode
+from surrealdb.data.types.table import Table
+from surrealdb.errors import UnsupportedFeatureError
+from surrealdb.request_message.message import RequestMessage
+from surrealdb.streaming import UNSUPPORTED_BY_EMBEDDED, AsyncStreamOps
+from surrealdb.types import Value
+from surrealdb_embedded import AsyncEmbeddedDB
+
+# The embedded engine builds no live-query notification channel (the Rust
+# extension reports ``LQ_SUPPORT = false``), so there is nowhere for
+# notifications to arrive.
+_NO_LIVE_QUERIES = (
+    "Live queries are only supported for WebSocket connections; the embedded "
+    "engine has no notification channel to deliver them over"
+)
+
+
+class AsyncEmbeddedSurrealConnection(AsyncWsSurrealConnection):
+    """
+    An async embedded SurrealDB connection using the Rust extension.
+
+    This class inherits all methods from AsyncWsSurrealConnection and only
+    overrides the connection management and message sending to use the embedded
+    database instead of WebSocket.
+
+    Attributes:
+        url: The URL of the embedded database (mem:// or file://).
+        id: The ID of the connection.
+    """
+
+    def __init__(self, url: str) -> None:
+        """
+        Constructor for the AsyncEmbeddedSurrealConnection class.
+
+        :param url: (str) The URL of the embedded database (mem:// or file://).
+        """
+        # The parent constructor opens nothing - it only sets attributes - and
+        # running it is what guarantees every inherited method finds the state
+        # it expects. Hand-copying a subset of it is how ``subscribe_live``
+        # came to fail with a bare ``AttributeError`` on ``live_queues``.
+        super().__init__(url)
+        # Embedded URLs address a local engine, not an HTTP endpoint, so they
+        # keep their original form instead of the parent's ``/rpc`` suffix.
+        self.raw_url = url
+        # The engine is compiled in, and has no handshake to report its
+        # version: an unknown version, so nothing is gated.
+        self._version_learned = True
+        self.id: str = str(uuid.uuid4())
+
+        # Embedded database handle
+        with mapped_engine_errors("opening the database"):
+            self._db: AsyncEmbeddedDB = AsyncEmbeddedDB(url)
+        # Whether `close()` has shut the engine down - see `connect`.
+        self._closed: bool = False
+
+    async def __aenter__(self) -> AsyncEmbeddedSurrealConnection:
+        """Context manager entry - connect to the embedded database."""
+        await self.connect()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        """Context manager exit - close the connection."""
+        await self.close()
+
+    async def connect(self, url: str | None = None) -> None:
+        """Connect to the embedded database endpoint.
+
+        Idempotent while the engine is open, and it reopens one that
+        :meth:`close` shut down. ``close()`` shuts the datastore down for good -
+        the handle it leaves behind answers every request with "Database
+        connection is closed" - while ``connect()`` on the native side is a
+        no-op that reports success, so reconnecting *said* it had worked and
+        then failed on the next query. The websocket transports have always
+        reopened here; this makes the embedded engine agree.
+
+        A reopened ``memory://`` database starts empty, because the one that
+        was closed is gone. That mirrors a reconnected websocket getting a new,
+        unauthenticated server-side session: closing a connection ends what was
+        behind it. A file-backed engine (``file://``, ``surrealkv://``) reopens
+        its store and keeps its data.
+
+        Args:
+            url: Optional new URL to connect to.
+
+        Example:
+            await db.connect()
+        """
+        if url is not None:
+            self.url = Url(url)
+            self.raw_url = url
+            with mapped_engine_errors("opening the database"):
+                self._db = AsyncEmbeddedDB(url)
+            self._closed = False
+            self._registry.clear()
+        elif self._closed:
+            with mapped_engine_errors("opening the database"):
+                self._db = AsyncEmbeddedDB(self.raw_url)
+            self._closed = False
+
+        with mapped_engine_errors("connecting"):
+            await self._db.connect()
+
+    async def close(self) -> None:
+        """Closes the connection to the database.
+
+        Idempotent, and leaves the connection reusable: :meth:`connect` opens a
+        fresh engine afterwards.
+
+        Example:
+            await db.close()
+        """
+        with mapped_engine_errors("closing"):
+            await self._db.close()
+        self._closed = True
+        # The engine forgot the session with the close, so forget it here too.
+        self._registry.clear()
+
+    async def _send(
+        self, message: RequestMessage, process: str, bypass: bool = False
+    ) -> dict[str, Any]:
+        """
+        Send a message to the embedded database using CBOR encoding.
+
+        This method overrides the WebSocket _send to use the Rust extension
+        instead of a network connection, while maintaining the same CBOR
+        message format for perfect compatibility.
+
+        Args:
+            message: The request message to send.
+            process: Description of the operation being performed.
+            bypass: Whether to bypass error checking.
+
+        Returns:
+            The decoded response dictionary.
+        """
+        # Encode message to CBOR (reuses existing WebSocket CBOR encoding)
+        cbor_request = message.WS_CBOR_DESCRIPTOR
+
+        # Execute via Rust extension
+        with mapped_engine_errors(process):
+            cbor_response_bytes = await self._db.execute(cbor_request)
+
+        # Decode CBOR response (reuses existing CBOR decoding)
+        response = decode(cbor_response_bytes)
+
+        # Check for errors (inherited method from UtilsMixin)
+        if not bypass:
+            self.check_response_for_error(response, process)
+
+        # Ensure response is a dict
+        if not isinstance(response, dict):
+            return {}
+
+        return response
+
+    async def export(self, options: ExportOptions | None = None) -> str:
+        raise UnsupportedFeatureError(
+            "an embedded database has no /export or /import endpoint; run "
+            "the export and import statements through query() instead"
+        )
+
+    async def export_to(
+        self, target: ExportTarget, options: ExportOptions | None = None
+    ) -> None:
+        raise UnsupportedFeatureError(
+            "an embedded database has no /export or /import endpoint; run "
+            "the export and import statements through query() instead"
+        )
+
+    async def import_(self, data: ImportData) -> None:
+        raise UnsupportedFeatureError(
+            "an embedded database has no /export or /import endpoint; run "
+            "the export and import statements through query() instead"
+        )
+
+    async def health(self) -> None:
+        raise UnsupportedFeatureError(
+            "health() asks a server's /health endpoint; an embedded database has "
+            "none, so a request that succeeds is the check that it is up"
+        )
+
+    async def attach(self) -> UUID:
+        raise UnsupportedFeatureError(
+            "Multi-session and client-side transactions are only supported for WebSocket connections"
+        )
+
+    async def detach(self, session_id: Any) -> None:
+        raise UnsupportedFeatureError(
+            "Multi-session and client-side transactions are only supported for WebSocket connections"
+        )
+
+    async def begin(self, session_id: Any = None) -> UUID:
+        raise UnsupportedFeatureError(
+            "Multi-session and client-side transactions are only supported for WebSocket connections"
+        )
+
+    async def commit(self, txn_id: Any, session_id: Any = None) -> None:
+        raise UnsupportedFeatureError(
+            "Multi-session and client-side transactions are only supported for WebSocket connections"
+        )
+
+    async def cancel(self, txn_id: Any, session_id: Any = None) -> None:
+        raise UnsupportedFeatureError(
+            "Multi-session and client-side transactions are only supported for WebSocket connections"
+        )
+
+    async def new_session(self) -> AsyncSurrealSession:
+        raise UnsupportedFeatureError(
+            "Multi-session and client-side transactions are only supported for WebSocket connections"
+        )
+
+    async def sessions(self) -> list[UUID]:
+        raise UnsupportedFeatureError(
+            "Multi-session and client-side transactions are only supported for WebSocket connections"
+        )
+
+    # Live queries -----------------------------------------------------------
+    #
+    # Refused up front rather than inherited. ``live`` and ``kill`` reached the
+    # engine and came back as "Unable to perform the realtime query", which
+    # says nothing about why; ``subscribe_live`` would have waited on a queue
+    # the background reader this connection does not run would have filled.
+
+    def _stream_ops(self) -> AsyncStreamOps:
+        """The embedded engine answers one response per request.
+
+        Its RPC entry point returns a single response, so there is no sequence
+        of frames to read and no request id to route them by: the inherited
+        websocket machinery has no socket to work with here. Streaming
+        therefore reports itself unavailable, and ``rows()`` runs the query
+        the buffered way and hands its rows back one at a time.
+        """
+        return AsyncStreamOps.never_streams(
+            self._stream_buffered, UNSUPPORTED_BY_EMBEDDED
+        )
+
+    async def live(
+        self,
+        table: str | Table,
+        diff: bool = False,
+        session_id: UUID | None = None,
+    ) -> AsyncLiveSubscription:
+        raise UnsupportedFeatureError(_NO_LIVE_QUERIES)
+
+    def live_of(
+        self, live_id: str | UUID, session_id: UUID | None = None
+    ) -> AsyncLiveSubscription:
+        raise UnsupportedFeatureError(_NO_LIVE_QUERIES)
+
+    async def kill(
+        self,
+        query_uuid: str | UUID,
+        session_id: UUID | None = None,
+    ) -> None:
+        raise UnsupportedFeatureError(_NO_LIVE_QUERIES)
+
+    async def subscribe_live(
+        self,
+        query_uuid: str | UUID,
+    ) -> AsyncGenerator[dict[str, Value], None]:
+        raise UnsupportedFeatureError(_NO_LIVE_QUERIES)
+
+    # All other methods (query, select, create, update, delete, merge, patch, etc.)
+    # are inherited from AsyncWsSurrealConnection and work automatically via _send()!

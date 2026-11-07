@@ -1,0 +1,705 @@
+"""
+SurrealDB SDK error hierarchy.
+
+All errors raised by this SDK extend ``SurrealError`` so that callers can
+``except SurrealError`` to catch everything.  Server-originated errors use
+the ``ServerError`` sub-tree which mirrors the structured error format
+(kind / details / cause) introduced in SurrealDB 3.x while remaining
+backward-compatible with the legacy code-only format.
+
+Failures that never reached the server, or that came back in a form with no
+structured error to parse, use the ``TransportError`` sub-tree instead.  The
+split is what retry logic keys on: a ``TransportError`` may succeed if tried
+again, a ``ServerError`` describes a decision the server already made.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    # `surrealdb.data.types.duration` imports `InvalidDurationError` from here,
+    # so importing it at module scope is a cycle. The property below imports it
+    # where it is used instead.
+    from surrealdb.data.types.duration import Duration
+
+# ------------------------------------------------------------------ #
+#  Base                                                                #
+# ------------------------------------------------------------------ #
+
+
+class SurrealError(Exception):
+    """Base class for every error raised by the SurrealDB Python SDK."""
+
+
+# ------------------------------------------------------------------ #
+#  ErrorKind constants                                                 #
+# ------------------------------------------------------------------ #
+
+
+class ErrorKind:
+    """Known error kinds returned by the SurrealDB server.
+
+    Use these constants for matching against ``ServerError.kind``.
+    """
+
+    VALIDATION = "Validation"
+    CONFIGURATION = "Configuration"
+    THROWN = "Thrown"
+    QUERY = "Query"
+    SERIALIZATION = "Serialization"
+    NOT_ALLOWED = "NotAllowed"
+    NOT_FOUND = "NotFound"
+    ALREADY_EXISTS = "AlreadyExists"
+    CONNECTION = "Connection"
+    INTERNAL = "Internal"
+
+
+# ------------------------------------------------------------------ #
+#  Detail kind constants (mirrors Rust ``ErrorDetails`` tree)          #
+# ------------------------------------------------------------------ #
+
+
+class AuthDetailKind:
+    """Detail kinds for authentication errors (nested inside ``NotAllowed``)."""
+
+    TOKEN_EXPIRED = "TokenExpired"
+    SESSION_EXPIRED = "SessionExpired"
+    INVALID_AUTH = "InvalidAuth"
+    UNEXPECTED_AUTH = "UnexpectedAuth"
+    MISSING_USER_OR_PASS = "MissingUserOrPass"
+    NO_SIGNIN_TARGET = "NoSigninTarget"
+    INVALID_PASS = "InvalidPass"
+    TOKEN_MAKING_FAILED = "TokenMakingFailed"
+    INVALID_SIGNUP = "InvalidSignup"
+    INVALID_ROLE = "InvalidRole"
+    NOT_ALLOWED = "NotAllowed"
+
+
+class ValidationDetailKind:
+    """Detail kinds for validation errors."""
+
+    PARSE = "Parse"
+    INVALID_REQUEST = "InvalidRequest"
+    INVALID_PARAMS = "InvalidParams"
+    NAMESPACE_EMPTY = "NamespaceEmpty"
+    DATABASE_EMPTY = "DatabaseEmpty"
+    INVALID_PARAMETER = "InvalidParameter"
+    INVALID_CONTENT = "InvalidContent"
+    INVALID_MERGE = "InvalidMerge"
+
+
+class ConfigurationDetailKind:
+    """Detail kinds for configuration errors."""
+
+    LIVE_QUERY_NOT_SUPPORTED = "LiveQueryNotSupported"
+    BAD_LIVE_QUERY_CONFIG = "BadLiveQueryConfig"
+    BAD_GRAPHQL_CONFIG = "BadGraphqlConfig"
+
+
+class QueryDetailKind:
+    """Detail kinds for query errors."""
+
+    NOT_EXECUTED = "NotExecuted"
+    TIMED_OUT = "TimedOut"
+    CANCELLED = "Cancelled"
+    TRANSACTION_CONFLICT = "TransactionConflict"
+
+
+class SerializationDetailKind:
+    """Detail kinds for serialization errors."""
+
+    SERIALIZATION = "Serialization"
+    DESERIALIZATION = "Deserialization"
+
+
+class NotAllowedDetailKind:
+    """Detail kinds for not-allowed errors."""
+
+    SCRIPTING = "Scripting"
+    AUTH = "Auth"
+    METHOD = "Method"
+    FUNCTION = "Function"
+    TARGET = "Target"
+
+
+class NotFoundDetailKind:
+    """Detail kinds for not-found errors."""
+
+    METHOD = "Method"
+    SESSION = "Session"
+    TABLE = "Table"
+    RECORD = "Record"
+    NAMESPACE = "Namespace"
+    DATABASE = "Database"
+    TRANSACTION = "Transaction"
+
+
+class AlreadyExistsDetailKind:
+    """Detail kinds for already-exists errors."""
+
+    SESSION = "Session"
+    TABLE = "Table"
+    RECORD = "Record"
+    NAMESPACE = "Namespace"
+    DATABASE = "Database"
+
+
+class ConnectionDetailKind:
+    """Detail kinds for connection errors."""
+
+    UNINITIALISED = "Uninitialised"
+    ALREADY_CONNECTED = "AlreadyConnected"
+
+
+# ------------------------------------------------------------------ #
+#  Detail helpers                                                      #
+#                                                                      #
+#  Server error details use the ``{kind, details?}`` wire format.      #
+# ------------------------------------------------------------------ #
+
+
+def _detail_kind(details: Any) -> str | None:
+    """Extract the ``kind`` from a ``{kind, details?}`` detail object."""
+    if isinstance(details, dict):
+        kind = details.get("kind")
+        if isinstance(kind, str):
+            return kind
+    return None
+
+
+def _detail_inner(details: Any) -> Any:
+    """Extract the ``details`` value from a ``{kind, details?}`` detail object."""
+    if isinstance(details, dict):
+        return details.get("details")
+    return None
+
+
+def _detail_field(details: Any, kind: str, field: str) -> str | None:
+    """Get a named string field from details matching *kind*."""
+    if _detail_kind(details) != kind:
+        return None
+    inner = _detail_inner(details)
+    if isinstance(inner, dict) and field in inner:
+        value = inner[field]
+        return str(value) if value is not None else None
+    return None
+
+
+# ------------------------------------------------------------------ #
+#  Server error hierarchy                                              #
+# ------------------------------------------------------------------ #
+
+
+class ServerError(SurrealError):
+    """Error received from the SurrealDB server.
+
+    Attributes:
+        kind: The structured error kind (e.g. ``"NotAllowed"``, ``"NotFound"``).
+        code: Legacy JSON-RPC error code.  ``0`` when unavailable.
+        details: Kind-specific structured details.  ``None`` when not provided.
+        server_cause: The underlying server error in the chain, if any.
+    """
+
+    def __init__(
+        self,
+        kind: str,
+        message: str,
+        code: int = 0,
+        details: dict[str, Any] | None = None,
+        cause: ServerError | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.kind: str = kind
+        self.code: int = code
+        self.details: dict[str, Any] | None = details
+        if cause is not None:
+            self.__cause__ = cause
+
+    @property
+    def server_cause(self) -> ServerError | None:
+        """The server-side cause (typed as ``ServerError``)."""
+        if isinstance(self.__cause__, ServerError):
+            return self.__cause__
+        return None
+
+    def has_kind(self, kind: str) -> bool:
+        """Check if this error or any cause in the chain matches *kind*."""
+        if self.kind == kind:
+            return True
+        cause = self.server_cause
+        if cause is not None:
+            return cause.has_kind(kind)
+        return False
+
+    def find_cause(self, kind: str) -> ServerError | None:
+        """Find the first error in the cause chain matching *kind*."""
+        if self.kind == kind:
+            return self
+        cause = self.server_cause
+        if cause is not None:
+            return cause.find_cause(kind)
+        return None
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(kind={self.kind!r}, message={str(self)!r})"
+
+
+# -- Subclasses per ErrorKind ---------------------------------------- #
+
+
+class ValidationError(ServerError):
+    """Validation failure (parse error, invalid request/params, bad input)."""
+
+    @property
+    def is_parse_error(self) -> bool:
+        return _detail_kind(self.details) == "Parse"
+
+    @property
+    def parameter_name(self) -> str | None:
+        return _detail_field(self.details, "InvalidParameter", "name")
+
+
+class ConfigurationError(ServerError):
+    """Feature or configuration not supported (live queries, GraphQL)."""
+
+    @property
+    def is_live_query_not_supported(self) -> bool:
+        return _detail_kind(self.details) == "LiveQueryNotSupported"
+
+
+class ThrownError(ServerError):
+    """User-thrown error via ``THROW`` in SurrealQL."""
+
+
+class QueryError(ServerError):
+    """Query execution failure (timeout, cancelled, not executed)."""
+
+    @property
+    def is_not_executed(self) -> bool:
+        return _detail_kind(self.details) == "NotExecuted"
+
+    @property
+    def is_timed_out(self) -> bool:
+        return _detail_kind(self.details) == "TimedOut"
+
+    @property
+    def is_cancelled(self) -> bool:
+        return _detail_kind(self.details) == "Cancelled"
+
+    @property
+    def is_transaction_conflict(self) -> bool:
+        return _detail_kind(self.details) == "TransactionConflict"
+
+    @property
+    def timeout(self) -> Duration | None:
+        """The timeout the statement exceeded, or ``None``.
+
+        A :class:`~surrealdb.Duration`, which is what the server sends - the
+        previous annotation said ``{"secs": ..., "nanos": ...}`` and the body
+        only accepted a ``dict``, so this returned ``None`` for every timeout on
+        every transport. Verified against SurrealDB 3.2.3, where the detail
+        arrives as ``{"kind": "TimedOut", "details": {"duration": Duration(...)}}``
+        on both websocket and HTTP.
+
+        Still ``None`` on 2.x, which sends no structured detail for a timeout at
+        all - that surfaces as an ``InternalError`` rather than a ``QueryError``,
+        so there is nothing to read the duration out of.
+
+        A ``{"secs": ..., "nanos": ...}`` mapping is also accepted and converted,
+        since no supported version sends one but the shape was what the old
+        annotation promised.
+        """
+        from surrealdb.data.types.duration import Duration
+
+        if _detail_kind(self.details) != "TimedOut":
+            return None
+        inner = _detail_inner(self.details)
+        if not isinstance(inner, dict):
+            return None
+        duration = inner.get("duration")
+        if isinstance(duration, Duration):
+            return duration
+        if isinstance(duration, dict):
+            secs = duration.get("secs")
+            nanos = duration.get("nanos")
+            if isinstance(secs, int) and isinstance(nanos, int):
+                return Duration(secs * 1_000_000_000 + nanos)
+        return None
+
+
+class SerializationError(ServerError):
+    """Serialization or deserialization failure."""
+
+    @property
+    def is_deserialization(self) -> bool:
+        return _detail_kind(self.details) == "Deserialization"
+
+
+class NotAllowedError(ServerError):
+    """Permission denied, method not allowed, function/scripting blocked."""
+
+    @property
+    def is_token_expired(self) -> bool:
+        if _detail_kind(self.details) != "Auth":
+            return False
+        return _detail_kind(_detail_inner(self.details)) == "TokenExpired"
+
+    @property
+    def is_invalid_auth(self) -> bool:
+        if _detail_kind(self.details) != "Auth":
+            return False
+        return _detail_kind(_detail_inner(self.details)) == "InvalidAuth"
+
+    @property
+    def is_scripting_blocked(self) -> bool:
+        return _detail_kind(self.details) == "Scripting"
+
+    @property
+    def method_name(self) -> str | None:
+        return _detail_field(self.details, "Method", "name")
+
+    @property
+    def function_name(self) -> str | None:
+        return _detail_field(self.details, "Function", "name")
+
+    @property
+    def target_name(self) -> str | None:
+        return _detail_field(self.details, "Target", "name")
+
+
+class NotFoundError(ServerError):
+    """Resource not found (table, record, namespace, method, etc.)."""
+
+    @property
+    def table_name(self) -> str | None:
+        return _detail_field(self.details, "Table", "name")
+
+    @property
+    def record_id(self) -> str | None:
+        return _detail_field(self.details, "Record", "id")
+
+    @property
+    def method_name(self) -> str | None:
+        return _detail_field(self.details, "Method", "name")
+
+    @property
+    def namespace_name(self) -> str | None:
+        return _detail_field(self.details, "Namespace", "name")
+
+    @property
+    def database_name(self) -> str | None:
+        return _detail_field(self.details, "Database", "name")
+
+    @property
+    def session_id(self) -> str | None:
+        return _detail_field(self.details, "Session", "id")
+
+
+class AlreadyExistsError(ServerError):
+    """Duplicate resource (record, table, namespace, etc.)."""
+
+    @property
+    def record_id(self) -> str | None:
+        return _detail_field(self.details, "Record", "id")
+
+    @property
+    def table_name(self) -> str | None:
+        return _detail_field(self.details, "Table", "name")
+
+    @property
+    def session_id(self) -> str | None:
+        return _detail_field(self.details, "Session", "id")
+
+    @property
+    def namespace_name(self) -> str | None:
+        return _detail_field(self.details, "Namespace", "name")
+
+    @property
+    def database_name(self) -> str | None:
+        return _detail_field(self.details, "Database", "name")
+
+
+class InternalError(ServerError):
+    """Internal or unexpected server error (fallback)."""
+
+
+# ------------------------------------------------------------------ #
+#  SDK-side errors                                                     #
+# ------------------------------------------------------------------ #
+
+
+class ImportFailedError(SurrealError):
+    """Statements in an import failed; the rest were applied.
+
+    Attributes:
+        failures: The error each failed statement gave, in order.
+    """
+
+    def __init__(self, failures: list[ServerError]) -> None:
+        shown = "; ".join(str(failure) for failure in failures[:3])
+        more = f" (and {len(failures) - 3} more)" if len(failures) > 3 else ""
+        super().__init__(
+            f"{len(failures)} statement(s) in the import failed: {shown}{more}"
+            if failures
+            else "the import failed, and the server did not say which statements"
+        )
+        self.failures: list[ServerError] = failures
+
+
+class TransportError(SurrealError):
+    """Transport-level failure that produced no structured server response.
+
+    Raised when a request could not be sent, could not be completed, or came
+    back in a form the SDK cannot interpret as an RPC result.  Distinct from
+    ``ServerError``, which represents a failure the server described in its
+    own structured error format.
+    """
+
+
+class ConnectionUnavailableError(TransportError):
+    """No active connection to the database."""
+
+
+class TransportTimeoutError(TransportError):
+    """The request timed out before the server responded."""
+
+
+class HttpStatusError(TransportError):
+    """The server returned a non-2xx HTTP response for an RPC request.
+
+    Attributes:
+        status: The HTTP status code.
+        body: The response body decoded as text, truncated.  Empty when the
+            response had no body.
+        url: The URL the request was sent to.
+    """
+
+    def __init__(self, status: int, body: str, url: str) -> None:
+        detail = f": {body}" if body else ""
+        super().__init__(f"HTTP {status} from {url}{detail}")
+        self.status: int = status
+        self.body: str = body
+        self.url: str = url
+
+
+class UnsupportedEngineError(SurrealError):
+    """The URL protocol/engine is not supported."""
+
+    def __init__(self, url: str) -> None:
+        super().__init__(
+            f"Unsupported protocol in URL: {url}. "
+            "Use 'ws://', 'wss://', 'http://', or 'https://' for remote connections. "
+            "For embedded connections ('memory', 'mem://', 'file://', 'surrealkv://', "
+            "'surrealkv+versioned://'), install: pip install surrealdb[embedded]"
+        )
+        self.url = url
+
+
+class UnsupportedFeatureError(SurrealError):
+    """Feature not supported by this connection type."""
+
+
+class UnavailableFeatureError(UnsupportedFeatureError):
+    """The connected server is too old (or too new) for a feature.
+
+    A subclass of :class:`UnsupportedFeatureError`, so code catching that still
+    catches this. Raised before anything is sent, from the version the server
+    reported when the connection opened.
+    """
+
+    def __init__(self, feature: str, version: str, since: str | None) -> None:
+        needs = f"SurrealDB {since} or later" if since else "a different server"
+        super().__init__(
+            f"{feature} needs {needs}, but this server is {version}. Upgrade "
+            "the server, or avoid this feature on this connection."
+        )
+        self.feature = feature
+        self.version = version
+        self.since = since
+
+
+class UnsupportedVersionError(SurrealError):
+    """The server's version is outside the range this SDK supports.
+
+    Raised when a connection opens. Build the connection with
+    ``version_check=False`` to connect anyway, at your own risk.
+    """
+
+    def __init__(self, version: str, minimum: str, maximum: str) -> None:
+        super().__init__(
+            f"SurrealDB {version} is not supported by this SDK, which supports "
+            f"{minimum} up to, but not including, {maximum}. Use a supported "
+            "server, or pass version_check=False to connect anyway."
+        )
+        self.version = version
+        self.minimum = minimum
+        self.maximum = maximum
+
+
+class UnexpectedResponseError(SurrealError):
+    """Server returned an unexpected response format."""
+
+
+class InvalidRecordIdError(SurrealError):
+    """RecordID string could not be parsed."""
+
+
+class InvalidDurationError(SurrealError):
+    """Duration string could not be parsed."""
+
+
+class InvalidGeometryError(SurrealError):
+    """Geometry data is invalid."""
+
+
+class InvalidTableError(SurrealError):
+    """Table or record ID string is invalid."""
+
+
+class InvalidUrlError(SurrealError):
+    """Connection URL could not be parsed.
+
+    Raised for a URL whose *scheme* is recognised but whose remainder is
+    malformed - an out-of-range port, a non-numeric port, an unterminated IPv6
+    literal. An unrecognised scheme raises :class:`UnsupportedEngineError`
+    instead, since that is a different mistake with a different fix.
+    """
+
+
+# ------------------------------------------------------------------ #
+#  Backward compatibility                                              #
+# ------------------------------------------------------------------ #
+
+SurrealDBMethodError = ServerError
+"""Deprecated alias kept for backward compatibility."""
+
+
+# ------------------------------------------------------------------ #
+#  Error parsing                                                       #
+# ------------------------------------------------------------------ #
+
+CODE_TO_KIND: dict[int, str] = {
+    -32700: "Validation",
+    -32600: "Validation",
+    -32603: "Validation",
+    -32601: "NotFound",
+    -32602: "NotAllowed",
+    -32002: "NotAllowed",
+    -32604: "Configuration",
+    -32605: "Configuration",
+    -32606: "Configuration",
+    -32000: "Internal",
+    -32001: "Connection",
+    -32003: "Query",
+    -32004: "Query",
+    -32005: "Query",
+    -32006: "Thrown",
+    -32007: "Serialization",
+    -32008: "Serialization",
+}
+
+KIND_TO_CLASS: dict[str, type[ServerError]] = {
+    "Validation": ValidationError,
+    "Configuration": ConfigurationError,
+    "Thrown": ThrownError,
+    "Query": QueryError,
+    "Serialization": SerializationError,
+    "NotAllowed": NotAllowedError,
+    "NotFound": NotFoundError,
+    "AlreadyExists": AlreadyExistsError,
+    "Internal": InternalError,
+}
+
+
+def _resolve_kind(kind: str | None, code: int | None) -> str:
+    """Determine the error kind from *kind* and/or legacy *code*.
+
+    SurrealDB 2.x sends no ``kind`` and only the generic ``-32000`` code, so
+    everything it rejects resolves to ``Internal`` - see the compatibility note
+    in the README's error-handling section.
+    """
+    if kind:
+        return kind
+    if code is not None:
+        return CODE_TO_KIND.get(code, "Internal")
+    return "Internal"
+
+
+# SurrealDB 3.x added the CBOR set tag; 2.x has no set representation at all -
+# it returns SurrealQL sets as plain arrays - and answers anything carrying the
+# tag with "unknown CBOR tag". Sets are the only value this SDK encodes that a
+# supported 2.x server cannot read, so the bare message is worth explaining
+# rather than passing straight through.
+_UNKNOWN_TAG_HINT = (
+    " (the server did not recognise a CBOR tag in the request: this SDK "
+    "encodes a Python set with SurrealDB 3.x's set tag, which SurrealDB 2.x "
+    "does not understand - send a list instead)"
+)
+
+
+def _explain(message: str) -> str:
+    """Add the likely cause to a server message that does not carry one."""
+    if "unknown CBOR tag" in message:
+        return message + _UNKNOWN_TAG_HINT
+    return message
+
+
+def parse_rpc_error(raw: Any) -> ServerError:
+    """Parse an RPC-level error response into a ``ServerError``.
+
+    Handles both the new format (``kind`` + ``details`` + ``cause``) and
+    the legacy format (``code`` + ``message`` only).
+
+    An error that is not an object at all is still turned into a
+    ``ServerError`` carrying its text. SurrealDB 2.x answers some failures -
+    a NUL byte anywhere in a request, for one - with a bare string where the
+    protocol calls for an error object, and reading ``kind`` off that raised
+    ``AttributeError`` from inside the SDK: the caller got no message, and
+    nothing an ``except SurrealError`` would catch.
+    """
+    if not isinstance(raw, dict):
+        return InternalError(kind="Internal", message=_explain(str(raw)), code=0)
+
+    kind = _resolve_kind(raw.get("kind"), raw.get("code"))
+    cause: ServerError | None = None
+    if raw.get("cause") is not None:
+        cause = parse_rpc_error(raw["cause"])
+    cls = KIND_TO_CLASS.get(kind, ServerError)
+    return cls(
+        kind=kind,
+        message=_explain(raw.get("message", "")),
+        code=raw.get("code", 0),
+        details=raw.get("details"),
+        cause=cause,
+    )
+
+
+def parse_query_error(raw: dict[str, Any]) -> ServerError:
+    """Parse a query result error into a ``ServerError``.
+
+    Query errors use ``result`` as the message field and have no ``code``.
+    """
+    kind = _resolve_kind(raw.get("kind"), None)
+    details = raw.get("details")
+
+    # Workaround: SurrealDB v3.0.0 double-wraps details in query result
+    # errors.  Fixed in v3.0.1, but kept for backward compatibility.
+    if (
+        isinstance(details, dict)
+        and details.get("kind") == kind
+        and isinstance(details.get("details"), dict)
+    ):
+        details = details["details"]
+
+    cause: ServerError | None = None
+    if raw.get("cause") is not None:
+        cause = parse_rpc_error(raw["cause"])
+    cls = KIND_TO_CLASS.get(kind, ServerError)
+    return cls(
+        kind=kind,
+        message=_explain(raw.get("result", "")),
+        code=0,
+        details=details,
+        cause=cause,
+    )
