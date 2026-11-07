@@ -36,7 +36,7 @@ surrealdb-core = { version = "4", default-features = false, features = [
 surrealdb-rpc = "4"
 surrealdb-types = "4"
 tokio = { version = "1", features = ["full"] }
-uuid = "1.27"
+uuid = "1.29.1"
 
 [profile.release]
 lto = true
